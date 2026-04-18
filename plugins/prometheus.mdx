@@ -1,0 +1,225 @@
+---
+title: 'Prometheus metrics for franz-go with kprom'
+description: 'Add Prometheus metrics to a franz-go Kafka client using kprom: track connections, byte counts, produce/fetch throughput, and expose them via an HTTP handler.'
+keywords: ['kprom', 'prometheus', 'franz-go', 'kafka metrics', 'go kafka prometheus']
+---
+
+The `kprom` package adds Prometheus metrics to any `kgo.Client` through the hooks system. Once registered, kprom tracks connection lifecycle events, bytes transferred to and from each broker, produce and fetch throughput per topic, and buffered record gauges — all with no changes required to your application's hot path. Metrics are namespaced under a prefix you choose, so multiple clients in the same process can coexist without label collisions.
+
+## Installation
+
+```bash
+go get github.com/twmb/franz-go/plugin/kprom
+```
+
+## Basic setup
+
+<Steps>
+  <Step title="Create a Metrics instance">
+    Call `kprom.NewMetrics` with your chosen namespace. kprom creates a private Prometheus registry by default, so you do not need an existing registry to get started.
+
+    ```go
+    import "github.com/twmb/franz-go/plugin/kprom"
+
+    metrics := kprom.NewMetrics("myapp")
+    ```
+  </Step>
+  <Step title="Register with the client">
+    Pass the `Metrics` value to `kgo.WithHooks`. The client will call the appropriate hook methods whenever connections, reads, writes, or batch events occur.
+
+    ```go
+    import "github.com/twmb/franz-go/pkg/kgo"
+
+    cl, err := kgo.NewClient(
+        kgo.SeedBrokers("localhost:9092"),
+        kgo.WithHooks(metrics),
+    )
+    if err != nil {
+        log.Fatal(err)
+    }
+    defer cl.Close()
+    ```
+  </Step>
+  <Step title="Expose metrics over HTTP">
+    Use `metrics.Handler()` to get an `http.Handler` backed by kprom's internal registry, then mount it on any path you like.
+
+    ```go
+    import "net/http"
+
+    go func() {
+        http.Handle("/metrics", metrics.Handler())
+        log.Fatal(http.ListenAndServe(":9999", nil))
+    }()
+    ```
+  </Step>
+</Steps>
+
+## Default metrics
+
+kprom tracks the following metrics out of the box. Every metric name is prefixed with the namespace you passed to `NewMetrics`. Node IDs for seed brokers are formatted as `seed_0`, `seed_1`, and so on.
+
+| Metric name | Type | Labels | Description |
+|---|---|---|---|
+| `{ns}_connects_total` | Counter | `node_id` | Successful broker connections opened |
+| `{ns}_connect_errors_total` | Counter | `node_id` | Failed broker connection attempts |
+| `{ns}_disconnects_total` | Counter | `node_id` | Broker connections closed |
+| `{ns}_write_bytes_total` | Counter | `node_id` | Bytes written to broker TCP connections (post-compression) |
+| `{ns}_write_errors_total` | Counter | `node_id` | Write errors per broker |
+| `{ns}_read_bytes_total` | Counter | `node_id` | Bytes read from broker TCP connections (pre-decompression) |
+| `{ns}_read_errors_total` | Counter | `node_id` | Read errors per broker |
+| `{ns}_produce_bytes_total` | Counter | `node_id`, `topic` | Uncompressed bytes produced per topic |
+| `{ns}_fetch_bytes_total` | Counter | `node_id`, `topic` | Uncompressed bytes fetched per topic |
+| `{ns}_buffered_produce_records_total` | Gauge | — | Records buffered in the client waiting to be produced |
+| `{ns}_buffered_produce_bytes` | Gauge | — | Bytes buffered in the client waiting to be produced |
+| `{ns}_buffered_fetch_records_total` | Gauge | — | Records buffered in the client waiting to be consumed |
+| `{ns}_buffered_fetch_bytes` | Gauge | — | Bytes buffered in the client waiting to be consumed |
+
+## Configuration options
+
+Pass options as additional arguments to `kprom.NewMetrics`.
+
+### Using an existing Prometheus registry
+
+By default kprom creates its own `prometheus.Registry`. To register metrics into the global registry or a registry you manage elsewhere, use `kprom.Registry`:
+
+```go
+import (
+    "github.com/prometheus/client_golang/prometheus"
+    "github.com/twmb/franz-go/plugin/kprom"
+)
+
+metrics := kprom.NewMetrics("myapp",
+    kprom.Registry(prometheus.DefaultRegisterer.(kprom.RegistererGatherer)),
+)
+```
+
+You can also separate the registerer from the gatherer using `kprom.Registerer` and `kprom.Gatherer` independently. Passing `nil` to `kprom.Registry` turns kprom into a custom Prometheus collector that you register into an external registry yourself.
+
+### Adding labels to all metrics
+
+`kprom.WithClientLabel` appends a `client_id` label to every metric, useful when multiple clients share the same registry:
+
+```go
+metrics := kprom.NewMetrics("myapp", kprom.WithClientLabel())
+```
+
+`kprom.WithStaticLabel` adds arbitrary constant labels:
+
+```go
+metrics := kprom.NewMetrics("myapp",
+    kprom.WithStaticLabel(prometheus.Labels{"environment": "production"}),
+)
+```
+
+### Enabling histogram timing metrics
+
+Histogram metrics are disabled by default to avoid cardinality overhead. Enable only the histograms you need:
+
+```go
+metrics := kprom.NewMetrics("myapp",
+    kprom.Histograms(
+        kprom.ReadWait,
+        kprom.ReadTime,
+        kprom.WriteWait,
+        kprom.WriteTime,
+        kprom.RequestDurationE2E,
+        kprom.RequestThrottled,
+    ),
+)
+```
+
+For fine-grained bucket control, use `kprom.HistogramsFromOpts`:
+
+```go
+metrics := kprom.NewMetrics("myapp",
+    kprom.HistogramsFromOpts(
+        kprom.HistogramOpts{
+            Enable:  kprom.ReadWait,
+            Buckets: prometheus.LinearBuckets(0.001, 0.002, 8),
+        },
+        kprom.HistogramOpts{
+            Enable: kprom.RequestDurationE2E,
+            // uses kprom.DefBuckets when Buckets is nil
+        },
+    ),
+)
+```
+
+The default histogram buckets (`kprom.DefBuckets`) are tailored for Kafka timing in seconds:
+`0.001, 0.002, 0.004, 0.008, 0.016, 0.032, 0.064, 0.128, 0.256, 0.512, 1.024, 2.048`.
+
+### Controlling fetch/produce metric detail
+
+By default produce and fetch metrics include `node_id` and `topic` labels and report uncompressed bytes. Use `kprom.FetchAndProduceDetail` to customise:
+
+```go
+metrics := kprom.NewMetrics("myapp",
+    kprom.FetchAndProduceDetail(
+        kprom.ByTopic,
+        kprom.ByNode,
+        kprom.Batches,
+        kprom.Records,
+        kprom.CompressedBytes,
+        kprom.UncompressedBytes,
+        kprom.ConsistentNaming, // renames produce_bytes_total -> produce_uncompressed_bytes_total
+    ),
+)
+```
+
+### Adding Go runtime and process metrics
+
+```go
+metrics := kprom.NewMetrics("myapp", kprom.GoCollectors())
+```
+
+### Custom subsystem
+
+Useful for grouping metrics when multiple subsystems share the same namespace:
+
+```go
+metrics := kprom.NewMetrics("myapp", kprom.Subsystem("kafka"))
+// produces myapp_kafka_connects_total, etc.
+```
+
+## Complete example
+
+The following is adapted from the `examples/plugins` example in the franz-go repository:
+
+```go
+package main
+
+import (
+    "fmt"
+    "log"
+    "net/http"
+    "strings"
+
+    "github.com/twmb/franz-go/pkg/kgo"
+    "github.com/twmb/franz-go/plugin/kprom"
+)
+
+func main() {
+    metrics := kprom.NewMetrics("kgo")
+
+    cl, err := kgo.NewClient(
+        kgo.SeedBrokers(strings.Split("localhost:9092", ",")...),
+        kgo.WithHooks(metrics),
+    )
+    if err != nil {
+        log.Fatal(err)
+    }
+    defer cl.Close()
+
+    go func() {
+        http.Handle("/metrics", metrics.Handler())
+        log.Fatal(http.ListenAndServe("localhost:9999", nil))
+    }()
+    fmt.Println("serving metrics on localhost:9999/metrics")
+
+    // use cl normally...
+}
+```
+
+<Note>
+kprom unregisters all metrics from its registry when the client is closed via `OnClientClosed`. This prevents stale metric registrations when clients are created and destroyed dynamically.
+</Note>

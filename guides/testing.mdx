@@ -1,0 +1,232 @@
+---
+title: 'Test Kafka code with the kfake package'
+description: 'Use the kfake in-memory Kafka cluster to unit-test producers and consumers without a real broker, intercept requests, and simulate errors in franz-go.'
+keywords: ['kafka', 'testing', 'kfake', 'unit test', 'mock', 'fake broker', 'franz-go']
+---
+
+The `kfake` package provides a fully in-memory Kafka cluster that runs inside your test process. It speaks the real Kafka wire protocol, so a `kgo.Client` connects to it without any special configuration. You can intercept specific request types to verify the data your code sends, inject error responses to test retry logic, or observe all traffic flowing through the cluster. Because `kfake` is in-process, round-trips are nearly instantaneous and no external processes are required.
+
+<Note>
+  `kfake` is a separate Go module. Add it to your project with:
+
+  ```bash
+  go get github.com/twmb/franz-go/pkg/kfake
+  ```
+</Note>
+
+## Creating a fake cluster
+
+Call `kfake.NewCluster` with functional options to configure the cluster:
+
+```go
+import (
+    "github.com/twmb/franz-go/pkg/kfake"
+    "github.com/twmb/franz-go/pkg/kgo"
+)
+
+cluster, err := kfake.NewCluster(
+    kfake.NumBrokers(1),
+    kfake.SeedTopics(3, "my-topic"), // 3 partitions, topic named "my-topic"
+)
+if err != nil {
+    t.Fatal(err)
+}
+defer cluster.Close()
+
+client, err := kgo.NewClient(kgo.SeedBrokers(cluster.ListenAddrs()...))
+if err != nil {
+    t.Fatal(err)
+}
+defer client.Close()
+```
+
+`SeedTopics` pre-creates a topic with the given number of partitions so you do not have to handle auto-creation in your tests.
+
+## Intercepting requests with ControlKey
+
+`ControlKey` registers a one-shot handler for a specific Kafka request type, identified by its protocol key. Once the handler fires, it is removed. Return `(nil, nil, false)` from the handler to let the cluster process the request normally after your observation; return `(response, nil, true)` to fully handle the request yourself.
+
+```go
+import "github.com/twmb/franz-go/pkg/kmsg"
+
+cluster.ControlKey(int16(kmsg.Produce), func(r kmsg.Request) (kmsg.Response, error, bool) {
+    req := r.(*kmsg.ProduceRequest)
+    // inspect req here
+    fmt.Println("intercepted produce to topic:", req.Topics[0].Name)
+    return nil, nil, false // let the cluster handle it
+})
+```
+
+To keep the control active across multiple requests, call `cluster.KeepControl()` inside the handler before returning.
+
+## Verifying produce requests
+
+The example below is taken from the franz-go documentation and shows a complete test that verifies the key, value, and topic ID of a produced record:
+
+```go
+import (
+    "bytes"
+    "context"
+    "encoding/hex"
+    "fmt"
+    "testing"
+
+    "github.com/twmb/franz-go/pkg/kfake"
+    "github.com/twmb/franz-go/pkg/kgo"
+    "github.com/twmb/franz-go/pkg/kmsg"
+)
+
+func TestProduceToTopicWithKey(t *testing.T) {
+    const (
+        testTopic = "test-topic"
+        testKey   = "test-key"
+        testValue = "test-value"
+    )
+    fakeCluster, err := kfake.NewCluster(
+        kfake.SeedTopics(1, testTopic),
+    )
+    if err != nil {
+        t.Fatal(err)
+    }
+    defer fakeCluster.Close()
+
+    client, err := kgo.NewClient(kgo.SeedBrokers(fakeCluster.ListenAddrs()...))
+    if err != nil {
+        t.Fatal(err)
+    }
+    defer client.Close()
+
+    var produceTopicID []byte
+    produceCnt := 0
+    var innerErr error
+    fakeCluster.ControlKey(int16(kmsg.Produce), func(r kmsg.Request) (kmsg.Response, error, bool) {
+        req := r.(*kmsg.ProduceRequest)
+
+        b := kmsg.NewRecordBatch()
+        err := b.ReadFrom(req.Topics[0].Partitions[0].Records)
+        if err != nil {
+            innerErr = err
+        }
+        if b.NumRecords != 1 {
+            innerErr = fmt.Errorf("expected 1 record, got %d", b.NumRecords)
+        }
+
+        rr := kmsg.NewRecord()
+        err = rr.ReadFrom(b.Records)
+        if err != nil {
+            innerErr = err
+        }
+
+        if string(rr.Key) != testKey {
+            innerErr = fmt.Errorf("expected key %s, got %s", testKey, string(rr.Key))
+        }
+        if string(rr.Value) != testValue {
+            innerErr = fmt.Errorf("expected value %s, got %s", testValue, string(rr.Value))
+        }
+
+        produceTopicID = req.Topics[0].TopicID[:]
+        produceCnt++
+        return nil, nil, false
+    })
+
+    err = client.ProduceSync(context.Background(), &kgo.Record{
+        Topic: testTopic,
+        Value: []byte(testValue),
+        Key:   []byte(testKey),
+    }).FirstErr()
+    if err != nil {
+        t.Fatal(err)
+    }
+
+    if innerErr != nil {
+        t.Fatal(innerErr)
+    }
+
+    if produceCnt != 1 {
+        t.Fatalf("expected 1 produce, got %d", produceCnt)
+    }
+    if !bytes.Equal(produceTopicID, fakeCluster.TopicInfo(testTopic).TopicID[:]) {
+        t.Fatalf("expected topic id %s, got %s",
+            hex.EncodeToString(fakeCluster.TopicInfo(testTopic).TopicID[:]),
+            hex.EncodeToString(produceTopicID))
+    }
+}
+```
+
+## Simulating error responses
+
+Return a fully constructed response with error codes to test that your code handles broker errors correctly. After the one-shot handler fires, `kgo.Client` retries and the request succeeds against the real cluster logic:
+
+```go
+import "github.com/twmb/franz-go/pkg/kerr"
+
+cluster.ControlKey(int16(kmsg.Produce), func(kreq kmsg.Request) (kmsg.Response, error, bool) {
+    req := kreq.(*kmsg.ProduceRequest)
+    resp := req.ResponseKind().(*kmsg.ProduceResponse)
+    for _, rt := range req.Topics {
+        st := kmsg.NewProduceResponseTopic()
+        st.Topic = rt.Topic
+        for _, rp := range rt.Partitions {
+            sp := kmsg.NewProduceResponseTopicPartition()
+            sp.Partition = rp.Partition
+            sp.ErrorCode = kerr.NotLeaderForPartition.Code
+            st.Partitions = append(st.Partitions, sp)
+        }
+        resp.Topics = append(resp.Topics, st)
+    }
+    return resp, nil, true // handled=true — kfake will not process this request
+})
+```
+
+## Observing all traffic
+
+Use `cluster.Control` (matches every request type) with `KeepControl` to count or log every protocol request without intercepting any of them:
+
+```go
+import (
+    "sync"
+    "github.com/twmb/franz-go/pkg/kmsg"
+)
+
+var mu sync.Mutex
+counts := make(map[string]int)
+
+cluster.Control(func(kreq kmsg.Request) (kmsg.Response, error, bool) {
+    cluster.KeepControl() // keep this observer alive
+    mu.Lock()
+    counts[kmsg.NameForKey(kreq.Key())]++
+    mu.Unlock()
+    return nil, nil, false // not handled — cluster processes normally
+})
+```
+
+## Coordinating asynchronous requests
+
+`SleepControl` yields execution inside a handler, allowing requests on other connections to proceed. This is useful for testing timing-sensitive scenarios such as ensuring a consumer receives data that arrives after its fetch request:
+
+```go
+cluster, _ := kfake.NewCluster(
+    kfake.NumBrokers(1),
+    kfake.SeedTopics(1, "test-topic"),
+    kfake.SleepOutOfOrder(), // allow requests on other connections while sleeping
+)
+
+produced := make(chan struct{}, 1)
+
+cluster.ControlKey(int16(kmsg.Fetch), func(kmsg.Request) (kmsg.Response, error, bool) {
+    cluster.SleepControl(func() {
+        <-produced // block until a produce arrives
+    })
+    cluster.DropControl() // remove this handler after it fires
+    return nil, nil, false
+})
+```
+
+<Tip>
+  Multiple `ControlKey` registrations for the same request type run in FIFO order. If a handler returns `handled=false`, the next registered handler for that key is tried before the cluster's own logic.
+</Tip>
+
+## Further reading
+
+- [kfake tests](https://github.com/twmb/franz-go/blob/main/pkg/kfake/issues_test.go) — real-world test examples covering edge cases
+- [testing_with_kfake example](https://github.com/twmb/franz-go/tree/main/examples/testing_with_kfake) — three demo modes: inject-error, observe, and sleep

@@ -1,97 +1,96 @@
 ---
-title: "Introduction"
-description: "Welcome to the new home for your documentation"
+title: "franz-go: Feature-complete Go Kafka client"
+description: "franz-go is a pure Go Kafka client supporting every Kafka version from 0.8.0 through 4.1+, with full EOS, consumer groups, SASL, and admin APIs built in."
 ---
 
-## Setting up
+franz-go is an all-encompassing Apache Kafka client written entirely in Go. It supports every Kafka feature from version 0.8.0 through 4.1+, including exactly-once semantics, cooperative consumer group rebalancing, all SASL mechanisms, all compression codecs, and a high-level admin API. If a client KIP exists, franz-go supports it.
 
-Get your documentation site up and running in minutes.
-
-<Card
-  title="Start here"
-  icon="rocket"
-  href="/quickstart"
-  horizontal
->
-  Follow our three step quickstart guide.
-</Card>
-
-## Make it yours
-
-Design a docs site that looks great and empowers your users.
-
-<Columns cols={2}>
-  <Card
-    title="Edit locally"
-    icon="pen-to-square"
-    href="/development"
-  >
-    Edit your docs locally and preview them in real time.
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Get a producer and consumer running against Kafka in under 5 minutes
   </Card>
-  <Card
-    title="Customize your site"
-    icon="palette"
-    href="/essentials/settings"
-  >
-    Customize the design and colors of your site to match your brand.
+  <Card title="Installation" icon="download" href="/installation">
+    Install franz-go and its optional packages with Go modules
   </Card>
-    <Card
-    title="Set up navigation"
-    icon="map"
-    href="/essentials/navigation"
-  >
-    Organize your docs to help users find what they need and succeed with your product.
+  <Card title="Producing & Consuming" icon="arrows-left-right" href="/concepts/producing">
+    Understand franz-go's produce and consume model, including EOS
   </Card>
-  <Card
-    title="API documentation"
-    icon="terminal"
-    href="/api-reference/introduction"
-  >
-    Auto-generate API documentation from OpenAPI specifications.
+  <Card title="API Reference" icon="code" href="/api/kgo">
+    Full API reference for kgo, kadm, kmsg, kfake, sr, and sasl packages
   </Card>
-</Columns>
+</CardGroup>
 
-## Create beautiful pages
+## Why franz-go?
 
-Everything you need to create world-class documentation.
+franz-go is the fastest and most memory-efficient Kafka client in Go — up to 4x faster at producing and 10–20x faster at consuming compared to alternatives. It is written entirely in pure Go with no C bindings, making it easy to cross-compile and deploy anywhere.
 
-<Columns cols={2}>
-  <Card
-    title="Write with MDX"
-    icon="pen-fancy"
-    href="/essentials/markdown"
-  >
-    Use MDX to style your docs pages.
+<CardGroup cols={3}>
+  <Card title="Full KIP coverage" icon="check-double">
+    Every non-Java-specific client-facing Kafka Improvement Proposal supported
   </Card>
-  <Card
-    title="Code samples"
-    icon="code"
-    href="/essentials/code"
-  >
-    Add sample code to demonstrate how to use your product.
+  <Card title="Exactly-once semantics" icon="shield-check">
+    Idempotent and transactional producers with GroupTransactSession for EOS
   </Card>
-  <Card
-    title="Images"
-    icon="image"
-    href="/essentials/images"
-  >
-    Display images and other media.
+  <Card title="Cooperative rebalancing" icon="arrows-rotate">
+    Zero-downtime consumer group rebalancing with KIP-429 cooperative-sticky balancer
   </Card>
-  <Card
-    title="Reusable snippets"
-    icon="recycle"
-    href="/essentials/reusable-snippets"
-  >
-    Write once and reuse across your docs.
+  <Card title="All SASL mechanisms" icon="lock">
+    GSSAPI/Kerberos, PLAIN, SCRAM-SHA-256/512, OAUTHBEARER, and JWT bearer
   </Card>
-</Columns>
+  <Card title="Hooks & metrics" icon="chart-line">
+    Pluggable hooks for Prometheus, OpenTelemetry, Zap, Zerolog, and more
+  </Card>
+  <Card title="In-memory testing" icon="flask">
+    kfake provides a fake Kafka cluster for unit tests — no external process needed
+  </Card>
+</CardGroup>
 
-## Need inspiration?
+## Compatible brokers
 
-<Card
-  title="See complete examples"
-  icon="stars"
-  href="https://mintlify.com/customers"
->
-  Browse our showcase of exceptional documentation sites.
-</Card>
+franz-go works with any Kafka-compatible broker:
+
+- **Apache Kafka** — all versions from 0.8.0 through 4.1+
+- **Redpanda** — the fastest Kafka-compatible streaming platform
+- **Confluent Platform** — enterprise Kafka distribution
+- **Amazon MSK** — managed Kafka on AWS
+- **Microsoft Event Hubs** — Azure's Kafka-compatible service
+
+## Get started
+
+<Steps>
+  <Step title="Install the main package">
+    ```bash
+    go get github.com/twmb/franz-go
+    ```
+  </Step>
+  <Step title="Create a client and produce a record">
+    ```go
+    cl, err := kgo.NewClient(
+        kgo.SeedBrokers("localhost:9092"),
+    )
+    if err != nil {
+        panic(err)
+    }
+    defer cl.Close()
+
+    record := &kgo.Record{Topic: "my-topic", Value: []byte("hello")}
+    if err := cl.ProduceSync(ctx, record).FirstErr(); err != nil {
+        panic(err)
+    }
+    ```
+  </Step>
+  <Step title="Poll for records">
+    ```go
+    for {
+        fetches := cl.PollFetches(ctx)
+        fetches.EachRecord(func(r *kgo.Record) {
+            fmt.Printf("offset %d: %s\n", r.Offset, r.Value)
+        })
+    }
+    ```
+  </Step>
+</Steps>
+
+<Tip>
+  See the [Quickstart](/quickstart) for a complete working example, including consumer groups and error handling.
+</Tip>

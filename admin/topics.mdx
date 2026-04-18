@@ -1,0 +1,259 @@
+---
+title: 'Manage Kafka topics with the kadm package'
+description: 'Create, delete, list, and configure Kafka topics using the kadm admin client, with real function signatures and working code examples.'
+keywords: ['kafka', 'topics', 'kadm', 'create topic', 'delete topic', 'alter configs', 'franz-go']
+---
+
+The `kadm` package provides methods for the full lifecycle of Kafka topics: creating them with specific partition counts and configurations, listing and describing their metadata, expanding their partition count, modifying their configuration, and deleting records or the topics themselves. All topic methods return typed response maps that carry per-topic error information so you can handle partial failures without losing the successful results.
+
+## Creating topics
+
+`CreateTopics` creates one or more topics in a single request. You specify the partition count, replication factor, and an optional config map. On Kafka 2.4+, you can pass `-1` for both numeric arguments to use the broker defaults:
+
+```go
+// Create two topics with broker defaults (Kafka 2.4+).
+responses, err := adm.CreateTopics(ctx, -1, -1, nil, "orders", "payments")
+if err != nil {
+    log.Fatal(err)
+}
+for _, r := range responses {
+    if r.Err != nil {
+        log.Printf("failed to create %s: %v", r.Topic, r.Err)
+        continue
+    }
+    fmt.Printf("created %s with %d partitions\n", r.Topic, r.NumPartitions)
+}
+```
+
+To set topic-level configuration at creation time, use `kadm.StringPtr` to build the config map:
+
+```go
+configs := map[string]*string{
+    "cleanup.policy":   kadm.StringPtr("compact"),
+    "retention.ms":     kadm.StringPtr("604800000"),
+}
+
+responses, err := adm.CreateTopics(ctx, 12, 3, configs, "user-events")
+```
+
+For creating a single topic and getting a single result directly, use `CreateTopic`:
+
+```go
+resp, err := adm.CreateTopic(ctx, 6, 3, nil, "my-topic")
+if err != nil {
+    log.Fatal(err)
+}
+fmt.Printf("created %s (ID: %s)\n", resp.Topic, resp.ID)
+```
+
+<Tip>
+Call `ValidateCreateTopics` with the same arguments before the real creation. It sends the request with `ValidateOnly: true`, so Kafka validates your configuration without actually creating the topic.
+</Tip>
+
+## Listing topics
+
+`ListTopics` issues a metadata request and returns a `TopicDetails` map keyed by topic name. Internal topics are excluded unless you name them explicitly:
+
+```go
+topics, err := adm.ListTopics(ctx)
+if err != nil {
+    log.Fatal(err)
+}
+
+for name, detail := range topics {
+    fmt.Printf("%s: %d partitions, err=%v\n",
+        name, len(detail.Partitions), detail.Err)
+}
+```
+
+To include internal topics (like `__consumer_offsets`), use `ListTopicsWithInternal`:
+
+```go
+topics, err := adm.ListTopicsWithInternal(ctx)
+```
+
+`TopicDetails` carries helpers for common lookups:
+
+```go
+// Check whether a topic exists before creating it.
+if topics.Has("orders") {
+    fmt.Println("topic already exists")
+}
+
+// Get a sorted list of all topic names.
+for _, name := range topics.Names() {
+    fmt.Println(name)
+}
+```
+
+## Describing topic partitions
+
+Each `TopicDetail` value in the map returned by `ListTopics` contains a `Partitions` field (`PartitionDetails`) with per-partition leader, replica, ISR, and error information:
+
+```go
+topics, err := adm.ListTopics(ctx, "orders")
+if err != nil {
+    log.Fatal(err)
+}
+
+detail := topics["orders"]
+for _, p := range detail.Partitions.Sorted() {
+    fmt.Printf("  partition %d: leader=%d replicas=%v isr=%v\n",
+        p.Partition, p.Leader, p.Replicas, p.ISR)
+}
+```
+
+## Adding partitions
+
+`CreatePartitions` adds partitions to existing topics. You specify how many partitions to *add* to the current count:
+
+```go
+// Add 6 partitions to "orders" and "payments".
+responses, err := adm.CreatePartitions(ctx, 6, "orders", "payments")
+if err != nil {
+    log.Fatal(err)
+}
+for _, r := range responses {
+    if r.Err != nil {
+        log.Printf("%s: %v", r.Topic, r.Err)
+    }
+}
+```
+
+If you already know the final partition count you want (rather than the delta), use `UpdatePartitions`:
+
+```go
+// Set "orders" to exactly 24 partitions.
+responses, err := adm.UpdatePartitions(ctx, 24, "orders")
+```
+
+## Modifying topic configuration
+
+### Incremental alter (recommended)
+
+`AlterTopicConfigs` applies targeted changes to individual configuration keys using the incremental alter protocol (Kafka 2.3+). Use `kadm.SetConfig`, `kadm.DeleteConfig`, `kadm.AppendConfig`, or `kadm.SubtractConfig` as the operation:
+
+```go
+configs := []kadm.AlterConfig{
+    {Op: kadm.SetConfig, Name: "retention.ms", Value: kadm.StringPtr("86400000")},
+    {Op: kadm.DeleteConfig, Name: "max.message.bytes"}, // reset to broker default
+}
+
+responses, err := adm.AlterTopicConfigs(ctx, configs, "orders", "payments")
+if err != nil {
+    log.Fatal(err)
+}
+for _, r := range responses {
+    if r.Err != nil {
+        log.Printf("%s: %v", r.Name, r.Err)
+    }
+}
+```
+
+### Full state alter
+
+`AlterTopicConfigsState` replaces the entire configuration for a topic. Any key you do not include reverts to the broker default. Use this with caution:
+
+```go
+configs := []kadm.AlterConfig{
+    {Name: "cleanup.policy", Value: kadm.StringPtr("compact")},
+    {Name: "retention.ms",   Value: kadm.StringPtr("604800000")},
+}
+
+responses, err := adm.AlterTopicConfigsState(ctx, configs, "user-events")
+```
+
+## Reading topic configuration
+
+`DescribeTopicConfigs` returns the current configuration for one or more topics. Each `ResourceConfig` carries a slice of `Config` values with their key, value, source, and any synonyms (fallback values):
+
+```go
+configs, err := adm.DescribeTopicConfigs(ctx, "orders")
+if err != nil {
+    log.Fatal(err)
+}
+
+for _, rc := range configs {
+    if rc.Err != nil {
+        log.Printf("%s: %v", rc.Name, rc.Err)
+        continue
+    }
+    fmt.Printf("configs for %s:\n", rc.Name)
+    for _, c := range rc.Configs {
+        fmt.Printf("  %s = %s (source: %s)\n",
+            c.Key, c.MaybeValue(), c.Source)
+    }
+}
+```
+
+## Deleting records
+
+`DeleteRecords` advances the log start offset for given topic-partitions, making records before that offset inaccessible. You build an `Offsets` map to specify the cutoff offset per partition:
+
+```go
+var offsets kadm.Offsets
+// Delete all records up to (but not including) offset 1000 on partition 0.
+offsets.AddOffset("orders", 0, 1000, -1)
+offsets.AddOffset("orders", 1, 500, -1)
+
+responses, err := adm.DeleteRecords(ctx, offsets)
+if err != nil {
+    log.Fatal(err)
+}
+responses.Each(func(r kadm.DeleteRecordsResponse) {
+    if r.Err != nil {
+        log.Printf("%s[%d]: %v", r.Topic, r.Partition, r.Err)
+        return
+    }
+    fmt.Printf("%s[%d]: new start offset = %d\n",
+        r.Topic, r.Partition, r.LowWatermark)
+})
+```
+
+<Warning>
+Deleting records is permanent. Kafka removes entire log segments when all records in them fall below the new start offset. There is no undo.
+</Warning>
+
+## Deleting topics
+
+`DeleteTopics` removes topics by name. `DeleteTopic` is a convenience wrapper for a single topic:
+
+```go
+resp, err := adm.DeleteTopic(ctx, "old-topic")
+if err != nil {
+    log.Fatal(err)
+}
+if resp.Err != nil {
+    log.Fatalf("delete failed: %v", resp.Err)
+}
+fmt.Printf("deleted %s\n", resp.Topic)
+```
+
+To delete multiple topics at once:
+
+```go
+responses, err := adm.DeleteTopics(ctx, "topic-a", "topic-b", "topic-c")
+if err != nil {
+    log.Fatal(err)
+}
+for _, r := range responses {
+    if r.Err != nil {
+        log.Printf("failed to delete %s: %v", r.Topic, r.Err)
+    }
+}
+```
+
+## Authorizing topic operations
+
+To include the list of operations you are authorized to perform on each topic in the metadata response, wrap your context with `kadm.WithAuthorizedOps`. The `AuthorizedOperations` field on each `TopicDetail` is then populated (requires Kafka 2.3+):
+
+```go
+ctx = kadm.WithAuthorizedOps(ctx)
+topics, err := adm.ListTopics(ctx)
+if err != nil {
+    log.Fatal(err)
+}
+for name, detail := range topics {
+    fmt.Printf("%s authorized ops: %v\n", name, detail.AuthorizedOperations)
+}
+```

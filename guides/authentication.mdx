@@ -1,0 +1,319 @@
+---
+title: 'Authenticate with Kafka using SASL and TLS'
+description: 'Configure SASL/PLAIN, SCRAM, Kerberos, OAUTHBEARER, and TLS client certificates in franz-go to authenticate with your Kafka cluster.'
+keywords: ['kafka', 'sasl', 'tls', 'authentication', 'plain', 'scram', 'kerberos', 'oauth', 'franz-go']
+---
+
+Franz-go supports every Kafka authentication mechanism through the `kgo.SASL` option and a pluggable dialer for TLS. Each SASL mechanism lives in its own sub-package under `github.com/twmb/franz-go/pkg/sasl/`, so you only import what you use. TLS is configured by replacing the default dialer with a `tls.Dialer`, giving you full control over certificates and cipher suites.
+
+## SASL mechanisms
+
+<Tabs>
+  <Tab title="PLAIN">
+    SASL/PLAIN sends credentials as plain text over the wire, so you must pair it with TLS in production. Import `github.com/twmb/franz-go/pkg/sasl/plain` and call `plain.Auth.AsMechanism()` to produce a static credential.
+
+    ```go
+    import (
+        "crypto/tls"
+        "net"
+        "time"
+
+        "github.com/twmb/franz-go/pkg/kgo"
+        "github.com/twmb/franz-go/pkg/sasl/plain"
+    )
+
+    tlsDialer := &tls.Dialer{NetDialer: &net.Dialer{Timeout: 10 * time.Second}}
+
+    cl, err := kgo.NewClient(
+        kgo.SeedBrokers("kafka.example.com:9092"),
+        kgo.Dialer(tlsDialer.DialContext),
+        kgo.SASL(plain.Auth{
+            User: "alice",
+            Pass: "s3cr3t",
+        }.AsMechanism()),
+    )
+    ```
+
+    If you need to rotate credentials at runtime, use `plain.Plain` instead and supply a callback function:
+
+    ```go
+    kgo.SASL(plain.Plain(func(ctx context.Context) (plain.Auth, error) {
+        token, err := fetchLatestToken(ctx)
+        return plain.Auth{User: "alice", Pass: token}, err
+    }))
+    ```
+  </Tab>
+
+  <Tab title="SCRAM-SHA-256">
+    SCRAM-SHA-256 provides a challenge-response handshake so the password is never sent over the wire. Import `github.com/twmb/franz-go/pkg/sasl/scram`.
+
+    ```go
+    import (
+        "crypto/tls"
+        "net"
+        "time"
+
+        "github.com/twmb/franz-go/pkg/kgo"
+        "github.com/twmb/franz-go/pkg/sasl/scram"
+    )
+
+    tlsDialer := &tls.Dialer{NetDialer: &net.Dialer{Timeout: 10 * time.Second}}
+
+    cl, err := kgo.NewClient(
+        kgo.SeedBrokers("kafka.example.com:9092"),
+        kgo.Dialer(tlsDialer.DialContext),
+        kgo.SASL(scram.Auth{
+            User: "alice",
+            Pass: "s3cr3t",
+        }.AsSha256Mechanism()),
+    )
+    ```
+
+    Use `AsSha256Mechanism()` for SHA-256. The `scram.Auth` struct also accepts a `Nonce` field if you need a deterministic nonce for testing, and an `IsToken` field when authenticating with a Kafka delegation token.
+  </Tab>
+
+  <Tab title="SCRAM-SHA-512">
+    SCRAM-SHA-512 is identical to SCRAM-SHA-256 but uses a stronger hash. Use `AsSha512Mechanism()` instead:
+
+    ```go
+    import (
+        "crypto/tls"
+        "net"
+        "time"
+
+        "github.com/twmb/franz-go/pkg/kgo"
+        "github.com/twmb/franz-go/pkg/sasl/scram"
+    )
+
+    tlsDialer := &tls.Dialer{NetDialer: &net.Dialer{Timeout: 10 * time.Second}}
+
+    cl, err := kgo.NewClient(
+        kgo.SeedBrokers("kafka.example.com:9092"),
+        kgo.Dialer(tlsDialer.DialContext),
+        kgo.SASL(scram.Auth{
+            User: "alice",
+            Pass: "s3cr3t",
+        }.AsSha512Mechanism()),
+    )
+    ```
+
+    The runtime-rotation callback form is also available: `scram.ScramSha512(func(ctx context.Context) (scram.Auth, error) { ... })`.
+  </Tab>
+
+  <Tab title="GSSAPI / Kerberos">
+    Kerberos authentication is provided by `github.com/twmb/franz-go/pkg/sasl/kerberos`, which wraps the `github.com/jcmturner/gokrb5/v8` library. Because it pulls in a heavier dependency, kerberos is its own Go module — run `go get github.com/twmb/franz-go/pkg/sasl/kerberos` separately.
+
+    ```go
+    import (
+        "github.com/jcmturner/gokrb5/v8/client"
+        "github.com/jcmturner/gokrb5/v8/config"
+        "github.com/jcmturner/gokrb5/v8/keytab"
+
+        "github.com/twmb/franz-go/pkg/kgo"
+        "github.com/twmb/franz-go/pkg/sasl/kerberos"
+    )
+
+    kt, err := keytab.Load("/etc/security/keytabs/kafka.keytab")
+    if err != nil {
+        log.Fatal(err)
+    }
+    cfg, err := config.Load("/etc/krb5.conf")
+    if err != nil {
+        log.Fatal(err)
+    }
+    kerberosClient := client.NewWithKeytab("kafka-user", "EXAMPLE.COM", kt, cfg)
+
+    cl, err := kgo.NewClient(
+        kgo.SeedBrokers("kafka.example.com:9092"),
+        kgo.SASL(kerberos.Auth{
+            Client:  kerberosClient,
+            Service: "kafka",
+        }.AsMechanism()),
+    )
+    ```
+
+    <Note>
+      `AsMechanism()` sets `PersistAfterAuth: true` so the same Kerberos client is reused across connections. Use `AsMechanismWithClose()` if you want the Kerberos client destroyed automatically when `kgo.Client.Close()` is called.
+    </Note>
+  </Tab>
+
+  <Tab title="OAUTHBEARER">
+    OAUTHBEARER (RFC 7628) passes a bearer token during the SASL handshake. Import `github.com/twmb/franz-go/pkg/sasl/oauth`.
+
+    ```go
+    import (
+        "context"
+
+        "github.com/twmb/franz-go/pkg/kgo"
+        "github.com/twmb/franz-go/pkg/sasl/oauth"
+    )
+
+    cl, err := kgo.NewClient(
+        kgo.SeedBrokers("kafka.example.com:9092"),
+        kgo.SASL(oauth.Oauth(func(ctx context.Context) (oauth.Auth, error) {
+            tok, err := fetchOAuthToken(ctx)
+            if err != nil {
+                return oauth.Auth{}, err
+            }
+            return oauth.Auth{Token: tok}, nil
+        })),
+    )
+    ```
+
+    The callback is invoked for every new broker connection, so short-lived tokens are automatically refreshed. You can also pass `Extensions` as a `map[string]string` for any custom OAUTHBEARER attributes required by your broker.
+
+    If you have a long-lived static token, use the shortcut:
+
+    ```go
+    kgo.SASL(oauth.Auth{Token: "my-static-token"}.AsMechanism())
+    ```
+  </Tab>
+
+  <Tab title="AWS MSK IAM">
+    AWS MSK IAM authentication is handled by `github.com/twmb/franz-go/pkg/sasl/aws`. Credentials are fetched from the standard AWS SDK credential chain (environment variables, shared config, IAM role, etc.).
+
+    ```go
+    import (
+        "context"
+
+        "github.com/aws/aws-sdk-go/aws/session"
+
+        "github.com/twmb/franz-go/pkg/kgo"
+        "github.com/twmb/franz-go/pkg/sasl/aws"
+    )
+
+    sess, err := session.NewSession()
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    cl, err := kgo.NewClient(
+        kgo.SeedBrokers("b-1.example.kafka.us-east-1.amazonaws.com:9098"),
+        kgo.SASL(aws.ManagedStreamingIAM(func(ctx context.Context) (aws.Auth, error) {
+            val, err := sess.Config.Credentials.GetWithContext(ctx)
+            if err != nil {
+                return aws.Auth{}, err
+            }
+            return aws.Auth{
+                AccessKey:    val.AccessKeyID,
+                SecretKey:    val.SecretAccessKey,
+                SessionToken: val.SessionToken,
+                UserAgent:    "my-app/v1.0.0",
+            }, nil
+        })),
+    )
+    ```
+
+    <Tip>
+      MSK IAM endpoints typically use port 9098 and require TLS. Add `kgo.Dialer((&tls.Dialer{}).DialContext)` alongside the SASL option.
+    </Tip>
+  </Tab>
+</Tabs>
+
+## TLS configuration
+
+<Steps>
+  <Step title="Enable TLS with the system certificate pool">
+    Replace the default dialer with a `tls.Dialer`. This uses your system's trusted CA certificates automatically, which is appropriate for most managed Kafka services.
+
+    ```go
+    import (
+        "crypto/tls"
+        "net"
+        "time"
+
+        "github.com/twmb/franz-go/pkg/kgo"
+    )
+
+    tlsDialer := &tls.Dialer{
+        NetDialer: &net.Dialer{Timeout: 10 * time.Second},
+    }
+
+    cl, err := kgo.NewClient(
+        kgo.SeedBrokers("kafka.example.com:9093"),
+        kgo.Dialer(tlsDialer.DialContext),
+    )
+    ```
+  </Step>
+
+  <Step title="Add a custom CA certificate">
+    When your Kafka brokers use a private CA, load its certificate and add it to the TLS config's root CAs:
+
+    ```go
+    import (
+        "crypto/tls"
+        "crypto/x509"
+        "os"
+
+        "github.com/twmb/franz-go/pkg/kgo"
+    )
+
+    caCert, err := os.ReadFile("/etc/kafka/ca.crt")
+    if err != nil {
+        log.Fatal(err)
+    }
+    certPool := x509.NewCertPool()
+    certPool.AppendCertsFromPEM(caCert)
+
+    tlsCfg := &tls.Config{RootCAs: certPool}
+    tlsDialer := &tls.Dialer{Config: tlsCfg}
+
+    cl, err := kgo.NewClient(
+        kgo.SeedBrokers("kafka.example.com:9093"),
+        kgo.Dialer(tlsDialer.DialContext),
+    )
+    ```
+  </Step>
+
+  <Step title="Mutual TLS with client certificates">
+    For brokers that require client authentication (mTLS), load both the client certificate and private key:
+
+    ```go
+    import (
+        "crypto/tls"
+        "crypto/x509"
+        "os"
+
+        "github.com/twmb/franz-go/pkg/kgo"
+    )
+
+    caCert, _ := os.ReadFile("/etc/kafka/ca.crt")
+    certPool := x509.NewCertPool()
+    certPool.AppendCertsFromPEM(caCert)
+
+    clientCert, err := tls.LoadX509KeyPair(
+        "/etc/kafka/client.crt",
+        "/etc/kafka/client.key",
+    )
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    tlsCfg := &tls.Config{
+        RootCAs:      certPool,
+        Certificates: []tls.Certificate{clientCert},
+    }
+    tlsDialer := &tls.Dialer{Config: tlsCfg}
+
+    cl, err := kgo.NewClient(
+        kgo.SeedBrokers("kafka.example.com:9093"),
+        kgo.Dialer(tlsDialer.DialContext),
+    )
+    ```
+  </Step>
+</Steps>
+
+## Verifying connectivity
+
+After creating the client, call `Ping` to confirm that authentication succeeds before your application starts processing:
+
+```go
+if err := cl.Ping(context.Background()); err != nil {
+    log.Fatalf("unable to connect and authenticate: %v", err)
+}
+fmt.Println("successfully connected and authenticated")
+```
+
+<Note>
+  Multiple SASL mechanisms can be registered in one call: `kgo.SASL(mech1, mech2)`. The client negotiates which mechanism to use based on what the broker advertises.
+</Note>

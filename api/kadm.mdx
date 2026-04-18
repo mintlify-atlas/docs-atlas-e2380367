@@ -1,0 +1,211 @@
+---
+title: "kadm package — Kafka admin client API"
+description: "API reference for the kadm package: a high-level Kafka admin client for managing topics, consumer groups, configs, ACLs, and brokers built on top of kgo."
+keywords: ["kafka", "admin", "kadm", "topics", "consumer groups", "acls", "configs", "franz-go"]
+---
+
+The `kadm` package provides an opinionated, high-level Kafka admin client built on top of a `*kgo.Client`. It covers the most common administrative tasks — creating and listing topics, managing consumer group offsets, altering configs, and working with ACLs — in a convenient API that hides the complexity of the underlying Kafka protocol. For operations that `kadm` does not cover, drop down to the `kmsg` package and issue raw protocol requests directly.
+
+```bash
+go get github.com/twmb/franz-go/pkg/kadm
+```
+
+```go
+import "github.com/twmb/franz-go/pkg/kadm"
+```
+
+For the complete auto-generated reference, see [pkg.go.dev/github.com/twmb/franz-go/pkg/kadm](https://pkg.go.dev/github.com/twmb/franz-go/pkg/kadm).
+
+---
+
+## Client
+
+`kadm.Client` is a thin wrapper around a `*kgo.Client`. You can create one from an existing kgo client or directly from kgo options.
+
+```go
+// From an existing kgo.Client:
+kgocl, _ := kgo.NewClient(kgo.SeedBrokers("localhost:9092"))
+admcl := kadm.NewClient(kgocl)
+defer admcl.Close()
+
+// Directly from options:
+admcl, err := kadm.NewOptClient(kgo.SeedBrokers("localhost:9092"))
+```
+
+| Function | Signature | Description |
+|---|---|---|
+| `NewClient` | `func NewClient(cl *kgo.Client) *Client` | Wraps an existing kgo client. |
+| `NewOptClient` | `func NewOptClient(opts ...kgo.Opt) (*Client, error)` | Creates a kgo client and wraps it. |
+| `Close` | `func (cl *Client) Close()` | Closes the underlying kgo client. |
+| `SetTimeoutMillis` | `func (cl *Client) SetTimeoutMillis(millis int32)` | Overrides the default 15 s request timeout. |
+
+---
+
+## Topics
+
+<AccordionGroup>
+  <Accordion title="Creating and deleting topics">
+
+```go
+// Create topics with the given partition count and replication factor.
+resps, err := admcl.CreateTopics(ctx, 3, 1, nil, "my-topic")
+if err != nil {
+    log.Fatal(err)
+}
+for _, r := range resps {
+    if r.Err != nil {
+        log.Printf("topic %s: %v", r.Topic, r.Err)
+    }
+}
+
+// Delete topics.
+dresps, err := admcl.DeleteTopics(ctx, "my-topic")
+```
+
+| Function | Signature | Description |
+|---|---|---|
+| `CreateTopics` | `func (cl *Client) CreateTopics(ctx context.Context, partitions int32, replicationFactor int16, configs map[string]*string, topics ...string) (CreateTopicResponses, error)` | Creates one or more topics. |
+| `DeleteTopics` | `func (cl *Client) DeleteTopics(ctx context.Context, topics ...string) (DeleteTopicResponses, error)` | Deletes one or more topics. |
+| `CreatePartitions` | `func (cl *Client) CreatePartitions(ctx context.Context, newCount int32, topics ...string) (CreatePartitionsResponses, error)` | Increases the partition count for existing topics. |
+| `DeleteRecords` | `func (cl *Client) DeleteRecords(ctx context.Context, os Offsets) (DeleteRecordsResponses, error)` | Deletes records up to the given offsets. |
+
+  </Accordion>
+  <Accordion title="Listing and describing topics">
+
+```go
+// List all non-internal topics.
+details, err := admcl.ListTopics(ctx)
+if err != nil {
+    log.Fatal(err)
+}
+for _, d := range details {
+    fmt.Printf("topic=%s partitions=%d\n", d.Topic, len(d.Partitions))
+}
+```
+
+| Function | Signature | Description |
+|---|---|---|
+| `ListTopics` | `func (cl *Client) ListTopics(ctx context.Context, topics ...string) (TopicDetails, error)` | Lists topics and their partition metadata. |
+| `ListTopicsWithInternal` | `func (cl *Client) ListTopicsWithInternal(ctx context.Context, topics ...string) (TopicDetails, error)` | Same as `ListTopics` but includes internal topics. |
+
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## Consumer groups
+
+<AccordionGroup>
+  <Accordion title="Listing and describing groups">
+
+```go
+listed, err := admcl.ListGroups(ctx)
+described, err := admcl.DescribeGroups(ctx, "my-group")
+```
+
+| Function | Signature | Description |
+|---|---|---|
+| `ListGroups` | `func (cl *Client) ListGroups(ctx context.Context, filterStates ...string) (ListedGroups, error)` | Returns all consumer groups. |
+| `DescribeGroups` | `func (cl *Client) DescribeGroups(ctx context.Context, groups ...string) (DescribedGroups, error)` | Returns detailed membership and assignment info for groups. |
+| `DeleteGroups` | `func (cl *Client) DeleteGroups(ctx context.Context, groups ...string) (DeleteGroupsResponses, error)` | Deletes one or more empty consumer groups. |
+
+  </Accordion>
+  <Accordion title="Offset management">
+
+```go
+// Fetch committed offsets for a group.
+offsets, err := admcl.FetchOffsets(ctx, "my-group")
+
+// Commit offsets on behalf of a group.
+err = admcl.CommitOffsets(ctx, "my-group", toCommit)
+
+// Calculate how far behind a group is.
+lag, err := admcl.CalculateGroupLag(ctx, described, endOffsets)
+```
+
+| Function | Signature | Description |
+|---|---|---|
+| `FetchOffsets` | `func (cl *Client) FetchOffsets(ctx context.Context, group string) (OffsetResponses, error)` | Returns committed offsets for all topics in a group. |
+| `FetchOffsetsForTopics` | `func (cl *Client) FetchOffsetsForTopics(ctx context.Context, group string, topics ...string) (OffsetResponses, error)` | Returns committed offsets for specific topics. |
+| `CommitOffsets` | `func (cl *Client) CommitOffsets(ctx context.Context, group string, os Offsets) (OffsetResponses, error)` | Commits offsets on behalf of a consumer group. |
+| `DeleteOffsets` | `func (cl *Client) DeleteOffsets(ctx context.Context, group string, s TopicsSet) (DeleteOffsetsResponses, error)` | Deletes committed offsets for a group. |
+| `CalculateGroupLag` | `func CalculateGroupLag(d DescribedGroup, commit OffsetResponses, end ListedOffsets) GroupLag` | Computes per-partition consumer lag. |
+
+<Tip>
+Use `kadm.OffsetsFromFetches(fetches)` to build an `Offsets` map from a set of kgo `Fetches` before calling `CommitOffsets`.
+</Tip>
+
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## Configs
+
+```go
+// Describe topic configs.
+resps, err := admcl.DescribeTopicConfigs(ctx, "my-topic")
+
+// Alter topic configs.
+err = admcl.AlterTopicConfigs(ctx, []kadm.AlterConfig{
+    {Name: "retention.ms", Value: kadm.StringPtr("86400000")},
+}, "my-topic")
+```
+
+| Function | Signature | Description |
+|---|---|---|
+| `DescribeTopicConfigs` | `func (cl *Client) DescribeTopicConfigs(ctx context.Context, topics ...string) (ResourceConfigs, error)` | Describes configs for one or more topics. |
+| `DescribeBrokerConfigs` | `func (cl *Client) DescribeBrokerConfigs(ctx context.Context, brokers ...int32) (ResourceConfigs, error)` | Describes configs for one or more brokers. |
+| `AlterTopicConfigs` | `func (cl *Client) AlterTopicConfigs(ctx context.Context, configs []AlterConfig, topics ...string) (AlterConfigsResponses, error)` | Replaces topic config values. |
+| `IncrementalAlterTopicConfigs` | `func (cl *Client) IncrementalAlterTopicConfigs(ctx context.Context, configs []IncrementalAlterConfig, topics ...string) (IncrementalAlterConfigsResponses, error)` | Incrementally alters topic config values (Kafka 2.3+). |
+
+---
+
+## ACLs
+
+`kadm` uses an `ACLBuilder` to construct ACL operations. Build the desired principal, host, resource, and operations, then call `CreateACLs`, `DescribeACLs`, or `DeleteACLs`.
+
+```go
+b := kadm.NewACLs().
+    Allow("User:alice").
+    AllowHosts("*").
+    Topics("my-topic").
+    Operations(kadm.OpRead, kadm.OpDescribe)
+
+err := admcl.CreateACLs(ctx, b)
+```
+
+| Function | Signature | Description |
+|---|---|---|
+| `CreateACLs` | `func (cl *Client) CreateACLs(ctx context.Context, b *ACLBuilder) (CreateACLsResults, error)` | Creates ACLs matching the builder. |
+| `DescribeACLs` | `func (cl *Client) DescribeACLs(ctx context.Context, b *ACLBuilder) (DescribeACLsResults, *ShardErrors, error)` | Returns ACLs that match the builder's filter. |
+| `DeleteACLs` | `func (cl *Client) DeleteACLs(ctx context.Context, b *ACLBuilder) (DeleteACLsResults, *ShardErrors, error)` | Deletes ACLs matching the builder's filter. |
+
+---
+
+## Misc
+
+| Function | Signature | Description |
+|---|---|---|
+| `ListBrokers` | `func (cl *Client) ListBrokers(ctx context.Context) (BrokerDetails, error)` | Returns all brokers in the cluster. |
+| `DescribeCluster` | `func (cl *Client) DescribeCluster(ctx context.Context) (DescribedCluster, error)` | Returns cluster-level metadata and broker list. |
+| `ApiVersions` | `func (cl *Client) ApiVersions(ctx context.Context) (BrokerApiVersions, *ShardErrors, error)` | Returns API versions supported by each broker. |
+
+### Helper functions
+
+`kadm` includes generic helpers for extracting single results from variadic responses:
+
+```go
+// Get the single topic response when you only created one topic.
+resp, err := kadm.AnyE(admcl.CreateTopics(ctx, 3, 1, nil, "my-topic"))
+
+// Get the first element from a slice response.
+first, err := kadm.FirstE(admcl.ListGroups(ctx))
+```
+
+| Function | Description |
+|---|---|
+| `Any[M](m M) (V, bool)` | Returns the first value from a map response. |
+| `AnyE[M](m M, err error) (V, error)` | Like `Any` but propagates the error. |
+| `First[S](s S) (T, bool)` | Returns the first element from a slice response. |
+| `FirstE[S](s S, err error) (T, error)` | Like `First` but propagates the error. |

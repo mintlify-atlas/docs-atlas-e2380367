@@ -1,0 +1,225 @@
+---
+title: "Producing Kafka messages with franz-go"
+description: "Learn how to produce records to Kafka using franz-go's async Produce, sync ProduceSync, TryProduce, idempotent writes, and latency-tuning options."
+keywords: ["kafka", "producer", "produce", "record", "franz-go", "kgo", "idempotent", "transactions"]
+---
+
+franz-go gives you three distinct ways to send records to Kafka: fire-and-forget async production with a callback, fully synchronous production that blocks until the broker confirms, and a non-blocking tryProduce that fails immediately when the internal buffer is full. All three share the same underlying `Record` type and the same reliability guarantees, so you can choose the style that best fits your application without sacrificing correctness.
+
+## The Record type
+
+Every message sent to Kafka is represented as a `*kgo.Record`. The fields you populate when producing are:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `Topic` | `string` | Destination topic. Required unless you set `DefaultProduceTopic`. |
+| `Key` | `[]byte` | Optional routing key, typically used with hash partitioners so records with the same key land on the same partition. |
+| `Value` | `[]byte` | The record payload. |
+| `Headers` | `[]RecordHeader` | Optional key/value metadata pairs passed through to consumers. Kafka ignores this field. |
+| `Timestamp` | `time.Time` | Creation timestamp. Set automatically to `time.Now()` if left unset. |
+| `Partition` | `int32` | Filled in by the client after the record is buffered. Set it yourself only when using `ManualPartitioner`. |
+
+After a successful produce the client also fills in `Offset`, `ProducerID`, `ProducerEpoch`, and `Attrs` so you can inspect them in the promise callback.
+
+### Record constructor helpers
+
+Rather than initializing a struct literal by hand, you can use one of four zero-allocation helpers that convert strings or byte slices into a `*Record`:
+
+```go
+// Value only, string
+r := kgo.StringRecord("hello world")
+
+// Key + value, strings
+r := kgo.KeyStringRecord("user-123", `{"action":"login"}`)
+
+// Value only, []byte
+r := kgo.SliceRecord(payload)
+
+// Key + value, []byte
+r := kgo.KeySliceRecord(key, payload)
+```
+
+<Warning>
+`StringRecord` and `KeyStringRecord` use the `unsafe` package to avoid copying the string into a slice. Do not modify `Key` or `Value` after calling these constructors — they are safe to pass to the client but not safe to mutate.
+</Warning>
+
+### Setting a default topic
+
+If your application produces to exactly one topic you can set it once at the client level and omit the `Topic` field on every record:
+
+```go
+cl, err := kgo.NewClient(
+    kgo.SeedBrokers("localhost:9092"),
+    kgo.DefaultProduceTopic("events"),
+)
+```
+
+The `DefaultProduceTopic` option is also applied to records whose `Topic` field is empty when producing to multiple topics, so you can mix targeted records with "default topic" records in the same client.
+
+## Async production with Produce
+
+`Produce` buffers the record and returns immediately. When the broker acknowledges (or fails) the record, the promise callback is invoked:
+
+```go
+ctx := context.Background()
+
+record := &kgo.Record{Topic: "events", Value: []byte("hello")}
+cl.Produce(ctx, record, func(r *kgo.Record, err error) {
+    if err != nil {
+        log.Printf("produce error offset=%d: %v", r.Offset, err)
+        return
+    }
+    log.Printf("produced to partition %d at offset %d", r.Partition, r.Offset)
+})
+```
+
+Promises are called serially on a single goroutine, so they must be fast. Avoid blocking inside a promise.
+
+If the client already has the maximum number of buffered records and `ManualFlushing` is **not** enabled, `Produce` blocks until space is available. Use the context to cancel the wait.
+
+## Sync production with ProduceSync
+
+`ProduceSync` blocks until all supplied records are acknowledged:
+
+```go
+results := cl.ProduceSync(ctx, record1, record2, record3)
+if err := results.FirstErr(); err != nil {
+    log.Fatalf("at least one record failed: %v", err)
+}
+```
+
+`ProduceSync` returns a `ProduceResults` slice — one entry per record — so you can inspect per-record errors if needed:
+
+```go
+for _, res := range results {
+    if res.Err != nil {
+        log.Printf("record failed: topic=%s partition=%d err=%v",
+            res.Record.Topic, res.Record.Partition, res.Err)
+    }
+}
+```
+
+When a linger is configured, `ProduceSync` bypasses it and triggers an immediate drain for the partitions it touched, so you do not pay unnecessary latency when you are already waiting for results.
+
+## Non-blocking async with TryProduce
+
+`TryProduce` behaves like `Produce` but returns `kgo.ErrMaxBuffered` immediately in the promise instead of blocking when the buffer is full:
+
+```go
+cl.TryProduce(ctx, record, func(r *kgo.Record, err error) {
+    if errors.Is(err, kgo.ErrMaxBuffered) {
+        // back-pressure: drop, queue externally, or slow down
+        return
+    }
+    if err != nil {
+        log.Printf("produce error: %v", err)
+    }
+})
+```
+
+Use `TryProduce` when you manage back-pressure yourself or when blocking is unacceptable (e.g., inside a hot event loop).
+
+## Batch error tracking with FirstErrPromise
+
+When you fire off many `Produce` calls and only care whether _any_ of them failed, `FirstErrPromise` eliminates the need to manage a WaitGroup and an error variable yourself:
+
+```go
+e := kgo.AbortingFirstErrPromise(cl)
+
+for _, msg := range batch {
+    r := kgo.StringRecord(msg)
+    r.Topic = "events"
+    cl.Produce(ctx, r, e.Promise())
+}
+
+// Blocks until all promises have been called, then returns the first error.
+if err := e.Err(); err != nil {
+    log.Printf("batch had at least one error: %v", err)
+}
+```
+
+`AbortingFirstErrPromise` goes one step further: as soon as the first error arrives it calls `AbortBufferedRecords` on the client so remaining records fail fast rather than waiting for the broker.
+
+If you only need to capture the first error without aborting, construct `FirstErrPromise` directly without the `AbortingFirstErrPromise` constructor.
+
+## Idempotent production
+
+By default, franz-go produces idempotently. The client negotiates a producer ID with the broker and attaches sequence numbers to every batch, which the broker uses to deduplicate retries. This means a network hiccup that causes a retry will never produce a duplicate message.
+
+<Note>
+Idempotent production requires `acks=all` and at least one in-sync replica. If you need `acks=0` or `acks=1` you must disable idempotency.
+</Note>
+
+To disable idempotent writes:
+
+```go
+cl, err := kgo.NewClient(
+    kgo.SeedBrokers("localhost:9092"),
+    kgo.DisableIdempotentWrite(),
+)
+```
+
+Only disable idempotency when you explicitly need no-ack or leader-only-ack semantics and can tolerate duplicates on retries.
+
+## Record reliability options
+
+By default the client retries records forever. Two options let you bound that behavior:
+
+```go
+cl, err := kgo.NewClient(
+    kgo.SeedBrokers("localhost:9092"),
+    // Give up after 5 retries.
+    kgo.RecordRetries(5),
+    // Or give up after 30 seconds regardless of retries.
+    kgo.RecordDeliveryTimeout(30 * time.Second),
+)
+```
+
+When a record is abandoned, all other records buffered on the same partition are also failed to keep sequence numbers consistent. A record is only abandoned when it is safe to do so — either it has never been sent, or the client received a response (even an error response) confirming the previous attempt is resolved.
+
+You can also cancel individual records by canceling the context passed to `Produce`:
+
+```go
+ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+defer cancel()
+cl.Produce(ctx, record, promise)
+```
+
+## Tuning latency
+
+### Linger
+
+By default there is no linger and records are dispatched as soon as they are buffered. In low-throughput scenarios adding a linger causes the client to accumulate records before sending, which increases batch sizes and reduces per-record overhead:
+
+```go
+cl, err := kgo.NewClient(
+    kgo.SeedBrokers("localhost:9092"),
+    kgo.ProducerLinger(5 * time.Millisecond),
+)
+```
+
+In high-throughput workloads records naturally batch together even without a linger, so this option is most useful when your send rate is low.
+
+### Manual flushing
+
+You can disable automatic flushing entirely and control exactly when records are sent:
+
+```go
+cl, err := kgo.NewClient(
+    kgo.SeedBrokers("localhost:9092"),
+    kgo.ManualFlushing(),
+    kgo.MaxBufferedRecords(10_000),
+)
+
+// Buffer as many records as you like, then flush.
+for _, r := range batch {
+    cl.Produce(ctx, r, nil)
+}
+if err := cl.Flush(ctx); err != nil {
+    log.Fatalf("flush failed: %v", err)
+}
+```
+
+<Tip>
+When using `ManualFlushing`, set `MaxBufferedRecords` to prevent unbounded memory growth while records are accumulating.
+</Tip>

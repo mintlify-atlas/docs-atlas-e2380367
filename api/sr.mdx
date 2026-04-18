@@ -1,0 +1,208 @@
+---
+title: "sr package — Schema Registry client API"
+description: "API reference for the sr package: an HTTP client for Confluent Schema Registry with support for Avro, Protobuf, JSON schemas and encode/decode via Serde."
+keywords: ["kafka", "schema registry", "sr", "avro", "protobuf", "serde", "franz-go"]
+---
+
+The `sr` package provides an HTTP client for Confluent-compatible Schema Registries and a `Serde` type that encodes and decodes values according to the Confluent wire format (a 5-byte header followed by the serialized payload). The `Client` speaks directly to the schema registry REST API; the `Serde` type caches schema IDs locally and handles the encode/decode lifecycle. The two are intentionally separate so that you can use each independently.
+
+```bash
+go get github.com/twmb/franz-go/pkg/sr
+```
+
+```go
+import "github.com/twmb/franz-go/pkg/sr"
+```
+
+For the complete reference, see [pkg.go.dev/github.com/twmb/franz-go/pkg/sr](https://pkg.go.dev/github.com/twmb/franz-go/pkg/sr).
+
+---
+
+## NewClient
+
+Create a schema registry client with `NewClient`. The default URL is `http://localhost:8081`.
+
+```go
+cl, err := sr.NewClient(
+    sr.URLs("http://schema-registry:8081"),
+    sr.BasicAuth("user", "pass"),
+)
+if err != nil {
+    log.Fatal(err)
+}
+```
+
+### Client options
+
+| Option | Description |
+|---|---|
+| `URLs(urls ...string)` | Schema registry URLs to use. The client tries each in order on failure. Defaults to `http://localhost:8081`. |
+| `BasicAuth(user, pass string)` | HTTP Basic authentication for every request. |
+| `BearerToken(token string)` | Bearer token for every request (`Authorization: Bearer $token`). |
+| `HTTPClient(httpcl *http.Client)` | Custom HTTP client, overriding the default 5 s timeout client. |
+| `DialTLSConfig(c *tls.Config)` | TLS configuration for the HTTP transport. |
+| `UserAgent(ua string)` | Custom `User-Agent` header. Defaults to `franz-go`. |
+| `DefaultSchemaContext(name string)` | Namespace all requests to the given schema context. |
+| `PreReq(fn func(*http.Request) error)` | Hook called before every HTTP request. |
+| `LogFn(fn func(int8, string, ...any))` | Logger function. |
+| `LogLevel(lvl int8)` | Static log level (0=None, 1=Error, 2=Warn, 3=Info, 4=Debug). |
+
+---
+
+## Schema type
+
+The `Schema` struct is the central data object for the schema registry API:
+
+```go
+type Schema struct {
+    Schema     string            // The raw schema text (JSON string for Avro/JSON, .proto text for Protobuf).
+    Type       SchemaType        // TypeAvro (default), TypeProtobuf, TypeJSON.
+    References []SchemaReference // Other schemas this schema references.
+    // ... metadata and rule fields omitted
+}
+
+type SubjectSchema struct {
+    Subject string
+    Version int
+    ID      int
+    Schema
+}
+```
+
+Schema types:
+
+| Constant | Description |
+|---|---|
+| `sr.TypeAvro` | Avro schema (default). |
+| `sr.TypeProtobuf` | Protobuf schema. |
+| `sr.TypeJSON` | JSON Schema. |
+
+---
+
+## Fetching schemas
+
+```go
+// Fetch a schema by its global integer ID.
+schema, err := cl.SchemaByID(ctx, 42)
+
+// Fetch all versions of a subject.
+versions, err := cl.Schemas(ctx, "my-topic-value")
+
+// Fetch a specific version.
+ss, err := cl.SchemaByVersion(ctx, "my-topic-value", 3)
+
+// List all subjects.
+subjects, err := cl.Subjects(ctx)
+```
+
+| Function | Signature | Description |
+|---|---|---|
+| `SchemaByID` | `func (cl *Client) SchemaByID(ctx context.Context, id int) (Schema, error)` | Returns a schema by its global ID. |
+| `SchemaByVersion` | `func (cl *Client) SchemaByVersion(ctx context.Context, subject string, version int) (SubjectSchema, error)` | Returns a specific version of a subject's schema. |
+| `Schemas` | `func (cl *Client) Schemas(ctx context.Context, subject string) ([]SubjectSchema, error)` | Returns all versions of a subject's schema. |
+| `AllSchemas` | `func (cl *Client) AllSchemas(ctx context.Context) ([]SubjectSchema, error)` | Returns all schemas across all subjects. |
+| `Subjects` | `func (cl *Client) Subjects(ctx context.Context) ([]string, error)` | Lists all subjects. |
+| `SubjectVersions` | `func (cl *Client) SubjectVersions(ctx context.Context, subject string) ([]int, error)` | Lists all version numbers for a subject. |
+
+---
+
+## Registering schemas
+
+```go
+ss, err := cl.CreateSchema(ctx, "my-topic-value", sr.Schema{
+    Schema: `{"type":"record","name":"Event","fields":[{"name":"id","type":"string"}]}`,
+    Type:   sr.TypeAvro,
+})
+fmt.Printf("registered schema id=%d version=%d\n", ss.ID, ss.Version)
+```
+
+| Function | Signature | Description |
+|---|---|---|
+| `CreateSchema` | `func (cl *Client) CreateSchema(ctx context.Context, subject string, s Schema) (SubjectSchema, error)` | Registers a schema under a subject. Returns the existing schema if already registered. |
+| `LookupSchema` | `func (cl *Client) LookupSchema(ctx context.Context, subject string, s Schema) (SubjectSchema, error)` | Checks if a schema is already registered without creating it. |
+
+---
+
+## Serde — encode and decode
+
+`Serde` handles the Confluent wire format: a 5-byte header (`\x00` + big-endian uint32 schema ID) prepended to the encoded payload. You register schema IDs and their encode/decode functions once, then call `Encode` and `Decode` at runtime.
+
+```go
+var serde sr.Serde
+
+// Register schema ID 42 with Avro encode/decode functions.
+serde.Register(42, MyAvroValue{},
+    sr.EncodeFn(func(v any) ([]byte, error) {
+        return avroCodec.BinaryFromNative(nil, v)
+    }),
+    sr.DecodeFn(func(b []byte, v any) error {
+        _, err := avroCodec.BinaryToNative(v.(*MyAvroValue), b)
+        return err
+    }),
+)
+
+// Encode a value (prepends the 5-byte header automatically).
+payload, err := serde.Encode(MyAvroValue{ID: "123"})
+
+// Decode from a Kafka record value.
+var out MyAvroValue
+if err := serde.Decode(record.Value, &out); err != nil {
+    log.Fatal(err)
+}
+```
+
+### Serde options
+
+| Option | Description |
+|---|---|
+| `EncodeFn(fn func(any) ([]byte, error))` | Encode function for a registered type. |
+| `AppendEncodeFn(fn func([]byte, any) ([]byte, error))` | More efficient encode function that appends to an existing slice. |
+| `DecodeFn(fn func([]byte, any) error)` | Decode function for a registered type. |
+| `GenerateFn(fn func() any)` | Factory function used by `DecodeNew` to create a fresh value to decode into. |
+| `Index(index ...int)` | Attaches a Protobuf message index (required for Protobuf schemas). |
+| `Header(h SerdeHeader)` | Custom wire format header. Defaults to `ConfluentHeader`. |
+
+### Serde methods
+
+| Method | Signature | Description |
+|---|---|---|
+| `Register` | `func (s *Serde) Register(id int, v any, opts ...EncodingOpt)` | Registers a schema ID with encode/decode functions. |
+| `Encode` | `func (s *Serde) Encode(v any) ([]byte, error)` | Encodes a value with the Confluent header prepended. |
+| `AppendEncode` | `func (s *Serde) AppendEncode(b []byte, v any) ([]byte, error)` | Appends the encoded value to b. |
+| `Decode` | `func (s *Serde) Decode(b []byte, v any) error` | Decodes b into v after stripping the header. |
+| `DecodeNew` | `func (s *Serde) DecodeNew(b []byte) (any, error)` | Decodes b into a new value created by `GenerateFn`. |
+| `DecodeID` | `func (s *Serde) DecodeID(b []byte) (id int, out []byte, err error)` | Strips and returns the schema ID from b. |
+
+---
+
+## Compatibility and subjects
+
+```go
+// Check the compatibility level for a subject.
+results := cl.Compatibility(ctx, "my-topic-value")
+
+// Set BACKWARD compatibility.
+cl.SetCompatibility(ctx, sr.SetCompatibility{
+    Level: sr.CompatibilityBackward,
+}, "my-topic-value")
+
+// Delete all versions of a subject.
+cl.DeleteSubject(ctx, "my-topic-value", sr.DeleteSoft)
+```
+
+---
+
+## srfake — testing without a real registry
+
+The `srfake` sub-package provides an in-memory schema registry HTTP server for use in tests:
+
+```go
+import "github.com/twmb/franz-go/pkg/sr/srfake"
+
+server := srfake.New()
+defer server.Close()
+
+cl, _ := sr.NewClient(sr.URLs(server.URL()))
+```
+
+The fake server supports the full schema registry REST API: creating, fetching, and deleting schemas and subjects, compatibility checks, and mode operations.

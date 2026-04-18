@@ -1,0 +1,261 @@
+---
+title: 'Manage consumer groups with kadm'
+description: 'List, describe, delete, and monitor Kafka consumer groups, committed offsets, and consumer lag using the kadm admin client for Go.'
+keywords: ['kafka', 'consumer groups', 'kadm', 'offsets', 'lag', 'franz-go', 'consumer lag']
+---
+
+The `kadm` package provides a complete set of tools for consumer group administration: listing all groups in a cluster, describing their membership and state, reading and committing offsets outside of a live consumer, calculating lag, and cleaning up stale group data. Because group coordinators are spread across brokers, many of these methods internally fan out to multiple brokers and merge the results — partial failures surface as `*ShardErrors` while still returning the data that was successfully retrieved.
+
+## Listing groups
+
+`ListGroups` returns a `ListedGroups` map keyed by group name. On Kafka 2.6+, you can filter by state:
+
+```go
+// List all groups.
+groups, err := adm.ListGroups(ctx)
+if err != nil {
+    log.Fatal(err)
+}
+for _, g := range groups.Sorted() {
+    fmt.Printf("%s (state: %s, type: %s)\n", g.Group, g.State, g.ProtocolType)
+}
+```
+
+```go
+// List only stable groups (Kafka 2.6+).
+groups, err := adm.ListGroups(ctx, "Stable")
+```
+
+On Kafka 3.8+, you can also filter by group type (`classic`, `consumer`, `share`, `streams`) using `ListGroupsByType`:
+
+```go
+groups, err := adm.ListGroupsByType(ctx, []string{"consumer"}, "Stable")
+```
+
+## Describing groups
+
+`DescribeGroups` returns detailed information about each group including its state, protocol, coordinator broker, and the full member list with assignments. Pass no group names to describe every group in the cluster:
+
+```go
+described, err := adm.DescribeGroups(ctx, "my-consumer-group")
+var se *kadm.ShardErrors
+if err != nil && !errors.As(err, &se) {
+    log.Fatal(err)
+}
+
+for _, g := range described {
+    if g.Err != nil {
+        log.Printf("%s: %v", g.Group, g.Err)
+        continue
+    }
+    fmt.Printf("group %s: state=%s members=%d\n",
+        g.Group, g.State, len(g.Members))
+    for _, m := range g.Members {
+        fmt.Printf("  member %s on %s\n", m.MemberID, m.ClientHost)
+        if a, ok := m.Assigned.AsConsumer(); ok {
+            for _, t := range a.Topics {
+                fmt.Printf("    topic %s partitions %v\n", t.Topic, t.Partitions)
+            }
+        }
+    }
+}
+```
+
+`AssignedPartitions` gives you the full set of topics and partitions assigned across all members:
+
+```go
+assigned := described["my-consumer-group"].AssignedPartitions()
+fmt.Println("assigned topics:", assigned.Topics())
+```
+
+<Note>
+For groups using the new consumer group protocol (KIP-848, Kafka 3.7+), use `DescribeConsumerGroups` instead of `DescribeGroups`. It returns `DescribedConsumerGroups` with epoch and target assignment fields.
+</Note>
+
+## Fetching committed offsets
+
+`FetchOffsets` returns all committed offsets for a group. `FetchOffsetsForTopics` is a convenience wrapper that also fills in a default offset of `-1` for any topic-partition that has not yet been committed to:
+
+```go
+// Fetch all committed offsets for a group.
+offsets, err := adm.FetchOffsets(ctx, "my-consumer-group")
+if err != nil {
+    log.Fatal(err)
+}
+offsets.Each(func(o kadm.OffsetResponse) {
+    if o.Err != nil {
+        log.Printf("%s[%d]: %v", o.Topic, o.Partition, o.Err)
+        return
+    }
+    fmt.Printf("%s[%d]: committed offset %d\n", o.Topic, o.Partition, o.At)
+})
+```
+
+```go
+// Fetch offsets for specific topics, with -1 for uncommitted partitions.
+offsets, err := adm.FetchOffsetsForTopics(ctx, "my-consumer-group", "orders", "payments")
+if err != nil {
+    log.Fatal(err)
+}
+```
+
+To block until any pending transactional offset commits are resolved (Kafka 2.5+), wrap your context with `kadm.RequireStable`:
+
+```go
+offsets, err := adm.FetchOffsets(kadm.RequireStable(ctx), "my-consumer-group")
+```
+
+### Fetching offsets for multiple groups
+
+`FetchManyOffsets` batches offset fetch requests for many groups at once:
+
+```go
+responses := adm.FetchManyOffsets(ctx, "group-a", "group-b", "group-c")
+responses.EachError(func(r kadm.FetchOffsetsResponse) {
+    log.Printf("%s: %v", r.Group, r.Err)
+})
+for _, r := range responses {
+    if r.Err != nil {
+        continue
+    }
+    fmt.Printf("%s: %d committed topic-partitions\n",
+        r.Group, len(r.Fetched))
+}
+```
+
+## Committing offsets
+
+`CommitOffsets` writes offset commits for a group from outside a live consumer. This is useful when you assign partitions manually and want to checkpoint progress in Kafka without running a full consumer group:
+
+```go
+var offsets kadm.Offsets
+offsets.AddOffset("orders", 0, 1500, -1)
+offsets.AddOffset("orders", 1, 2200, -1)
+
+responses, err := adm.CommitOffsets(ctx, "my-consumer-group", offsets)
+if err != nil {
+    log.Fatal(err)
+}
+if err := responses.Error(); err != nil {
+    log.Fatalf("commit had errors: %v", err)
+}
+```
+
+`CommitAllOffsets` combines both the request error and the per-offset error check in one call, returning the first error encountered:
+
+```go
+err := adm.CommitAllOffsets(ctx, "my-consumer-group", offsets)
+if err != nil {
+    log.Fatal(err)
+}
+```
+
+## Calculating consumer lag
+
+`Lag` is a high-level convenience method that describes the group, fetches committed offsets, lists start and end offsets for all assigned/committed topics, and returns a `DescribedGroupLags` map with per-partition lag values:
+
+```go
+lags, err := adm.Lag(ctx, "my-consumer-group")
+var ae *kadm.AuthError
+if errors.As(err, &ae) {
+    log.Fatalf("not authorized: %v", ae)
+}
+if err != nil {
+    log.Fatal(err)
+}
+
+for _, gl := range lags {
+    if gl.Error() != nil {
+        log.Printf("%s: %v", gl.Group, gl.Error())
+        continue
+    }
+    fmt.Printf("group %s total lag: %d\n", gl.Group, gl.Lag.Total())
+    for _, ml := range gl.Lag.Sorted() {
+        fmt.Printf("  %s[%d]: commit=%d end=%d lag=%d\n",
+            ml.Topic, ml.Partition, ml.Commit.At, ml.End.Offset, ml.Lag)
+    }
+}
+```
+
+For more control over each step, use `CalculateGroupLag` directly. It accepts a `DescribedGroup`, its `OffsetResponses`, and the `ListedOffsets` for the end of each partition:
+
+```go
+groups, _ := adm.DescribeGroups(ctx, "my-consumer-group")
+commits := adm.FetchManyOffsets(ctx, "my-consumer-group")
+endOffsets, _ := adm.ListEndOffsets(ctx, "orders")
+
+for _, g := range groups {
+    lag := kadm.CalculateGroupLag(g, commits[g.Group].Fetched, endOffsets)
+    fmt.Printf("total lag for %s: %d\n", g.Group, lag.Total())
+}
+```
+
+## Deleting committed offsets
+
+`DeleteOffsets` removes committed offsets for specific topic-partitions within a group (Kafka 2.4+). This is useful when a group has stopped consuming a topic and you want to clean up stale offset data so that lag monitors stop reporting ever-increasing numbers:
+
+```go
+// Build a TopicsSet of the partitions to remove.
+var toDelete kadm.TopicsSet
+toDelete.Add("old-topic", 0, 1, 2)
+
+responses, err := adm.DeleteOffsets(ctx, "my-consumer-group", toDelete)
+var ae *kadm.AuthError
+if errors.As(err, &ae) {
+    log.Fatalf("not authorized: %v", ae)
+}
+if err != nil {
+    log.Fatal(err)
+}
+responses.EachError(func(topic string, partition int32, err error) {
+    log.Printf("%s[%d]: %v", topic, partition, err)
+})
+```
+
+<Warning>
+The group must be in the `Empty` state before you can delete its offsets. Stop all consumers in the group before calling `DeleteOffsets`.
+</Warning>
+
+## Deleting groups
+
+`DeleteGroups` removes consumer groups entirely. The group must be empty (no active members) before you can delete it:
+
+```go
+responses, err := adm.DeleteGroups(ctx, "stale-group-a", "stale-group-b")
+if err != nil {
+    log.Fatal(err)
+}
+for _, r := range responses {
+    if r.Err != nil {
+        log.Printf("failed to delete %s: %v", r.Group, r.Err)
+    }
+}
+```
+
+`DeleteGroup` is a single-group convenience that also returns the per-group error directly:
+
+```go
+resp, err := adm.DeleteGroup(ctx, "stale-group")
+if err != nil {
+    log.Fatal(err)
+}
+fmt.Printf("deleted group %s\n", resp.Group)
+```
+
+## Removing static group members
+
+For groups using static membership (KIP-345), `LeaveGroup` lets you remove specific instance IDs without waiting for their session timeout to expire. This is useful when scaling down a deployment:
+
+```go
+builder := kadm.LeaveGroup("my-consumer-group").
+    InstanceIDs("worker-1", "worker-2").
+    Reason("scaling down")
+
+responses, err := adm.LeaveGroup(ctx, builder)
+if err != nil {
+    log.Fatal(err)
+}
+responses.EachError(func(r kadm.LeaveGroupResponse) {
+    log.Printf("instance %s: %v", r.InstanceID, r.Err)
+})
+```

@@ -1,0 +1,302 @@
+---
+title: 'Use the Schema Registry client (sr package)'
+description: 'Register Avro and Protobuf schemas, encode and decode records with sr.Serde, and test schema registry interactions with srfake in the franz-go sr package.'
+keywords: ['kafka', 'schema registry', 'avro', 'protobuf', 'confluent', 'serde', 'franz-go', 'sr']
+---
+
+The `sr` package provides a Schema Registry client and a `Serde` helper that handles the Confluent wire format — a five-byte header containing a magic byte and a four-byte schema ID, followed by the serialized payload. The `Client` type speaks HTTP to your schema registry and returns raw schema information; the `Serde` type caches encode and decode functions keyed by schema ID, giving you a strongly-typed serialization layer on top of any encoding library.
+
+```bash
+go get github.com/twmb/franz-go/pkg/sr
+```
+
+## Creating a client
+
+`sr.NewClient` accepts functional options. Pass `sr.URLs` to point at your registry:
+
+```go
+import "github.com/twmb/franz-go/pkg/sr"
+
+rcl, err := sr.NewClient(sr.URLs("http://localhost:8081"))
+if err != nil {
+    log.Fatal(err)
+}
+```
+
+You can pass multiple URLs for failover, and use `sr.BasicAuth` or `sr.BearerToken` for authentication against a secured registry.
+
+## Registering a schema
+
+Call `CreateSchema` to register a new schema or retrieve an existing one by content. The registry returns a `SubjectSchema` containing the assigned ID:
+
+```go
+import (
+    "context"
+    "github.com/twmb/franz-go/pkg/sr"
+)
+
+schemaText := `{
+    "type": "record",
+    "name": "simple",
+    "namespace": "org.hamba.avro",
+    "fields": [
+        {"name": "a", "type": "long"},
+        {"name": "b", "type": "string"}
+    ]
+}`
+
+ss, err := rcl.CreateSchema(context.Background(), "my-topic-value", sr.Schema{
+    Schema: schemaText,
+    Type:   sr.TypeAvro,
+})
+if err != nil {
+    log.Fatal(err)
+}
+fmt.Printf("schema subject %q version %d id %d\n", ss.Subject, ss.Version, ss.ID)
+```
+
+`CreateSchema` is idempotent — if the identical schema already exists under the subject, the registry returns the existing schema ID.
+
+## Encoding and decoding with Serde
+
+`sr.Serde` maps schema IDs to encode/decode functions. Register a type and its schema ID before producing or consuming:
+
+```go
+import (
+    "github.com/hamba/avro/v2"
+    "github.com/twmb/franz-go/pkg/sr"
+)
+
+type example struct {
+    A int64  `avro:"a"`
+    B string `avro:"b"`
+}
+
+avroSchema, err := avro.Parse(schemaText)
+if err != nil {
+    log.Fatal(err)
+}
+
+var serde sr.Serde
+serde.Register(
+    ss.ID,
+    example{},
+    sr.EncodeFn(func(v any) ([]byte, error) {
+        return avro.Marshal(avroSchema, v)
+    }),
+    sr.DecodeFn(func(b []byte, v any) error {
+        return avro.Unmarshal(avroSchema, b, v)
+    }),
+)
+```
+
+### Producing schema-encoded records
+
+Use `serde.MustEncode` (or `serde.Encode` for explicit error handling) to wrap your value in the Confluent wire format before handing it to the Kafka producer:
+
+```go
+cl.Produce(
+    context.Background(),
+    &kgo.Record{
+        Value: serde.MustEncode(example{
+            A: time.Now().Unix(),
+            B: "hello",
+        }),
+    },
+    func(r *kgo.Record, err error) {
+        if err != nil {
+            log.Printf("produce error: %v", err)
+            return
+        }
+        fmt.Printf("produced record, encoded bytes: %x\n", r.Value)
+    },
+)
+```
+
+### Consuming and decoding records
+
+Use `serde.Decode` to parse the wire-format header and dispatch to the correct decode function:
+
+```go
+fetches := cl.PollFetches(context.Background())
+fetches.EachRecord(func(r *kgo.Record) {
+    var ex example
+    if err := serde.Decode(r.Value, &ex); err != nil {
+        log.Printf("decode error: %v", err)
+        return
+    }
+    fmt.Printf("consumed: A=%d B=%s\n", ex.A, ex.B)
+})
+```
+
+## Complete example
+
+The following is the full schema registry example from the franz-go repository, showing schema registration, produce, and consume in a single program:
+
+```go
+package main
+
+import (
+    "context"
+    "flag"
+    "fmt"
+    "os"
+    "strings"
+    "time"
+
+    "github.com/hamba/avro/v2"
+
+    "github.com/twmb/franz-go/pkg/kgo"
+    "github.com/twmb/franz-go/pkg/sr"
+)
+
+var (
+    seedBrokers = flag.String("brokers", "localhost:9092", "comma delimited list of seed brokers")
+    topic       = flag.String("topic", "test", "topic to produce to and consume from")
+    registry    = flag.String("registry", "localhost:8081", "schema registry port to talk to")
+)
+
+var schemaText = `{
+    "type": "record",
+    "name": "simple",
+    "namespace": "org.hamba.avro",
+    "fields" : [
+        {"name": "a", "type": "long"},
+        {"name": "b", "type": "string"}
+    ]
+}`
+
+type example struct {
+    A int64  `avro:"a"`
+    B string `avro:"b"`
+}
+
+func main() {
+    flag.Parse()
+
+    // Ensure our schema is registered.
+    rcl, err := sr.NewClient(sr.URLs(*registry))
+    if err != nil {
+        fmt.Fprintf(os.Stderr, "unable to create schema registry client: %v\n", err)
+        os.Exit(1)
+    }
+    ss, err := rcl.CreateSchema(context.Background(), *topic+"-value", sr.Schema{
+        Schema: schemaText,
+        Type:   sr.TypeAvro,
+    })
+    if err != nil {
+        fmt.Fprintf(os.Stderr, "unable to create avro schema: %v\n", err)
+        os.Exit(1)
+    }
+    fmt.Printf("created or reusing schema subject %q version %d id %d\n", ss.Subject, ss.Version, ss.ID)
+
+    // Setup our serializer / deserializer.
+    avroSchema, err := avro.Parse(schemaText)
+    if err != nil {
+        fmt.Fprintf(os.Stderr, "unable to parse avro schema: %v\n", err)
+        os.Exit(1)
+    }
+    var serde sr.Serde
+    serde.Register(
+        ss.ID,
+        example{},
+        sr.EncodeFn(func(v any) ([]byte, error) {
+            return avro.Marshal(avroSchema, v)
+        }),
+        sr.DecodeFn(func(b []byte, v any) error {
+            return avro.Unmarshal(avroSchema, b, v)
+        }),
+    )
+
+    // Loop producing & consuming.
+    cl, err := kgo.NewClient(
+        kgo.SeedBrokers(strings.Split(*seedBrokers, ",")...),
+        kgo.DefaultProduceTopic(*topic),
+        kgo.ConsumeTopics(*topic),
+    )
+    if err != nil {
+        fmt.Fprintf(os.Stderr, "unable to init kgo client: %v\n", err)
+        os.Exit(1)
+    }
+    for {
+        cl.Produce(
+            context.Background(),
+            &kgo.Record{
+                Value: serde.MustEncode(example{
+                    A: time.Now().Unix(),
+                    B: "hello",
+                }),
+            },
+            func(r *kgo.Record, err error) {
+                if err != nil {
+                    fmt.Fprintf(os.Stderr, "unable to produce: %v\n", err)
+                    os.Exit(1)
+                }
+                fmt.Printf("Produced simple record, value bytes: %x\n", r.Value)
+            },
+        )
+
+        fs := cl.PollFetches(context.Background())
+        fs.EachRecord(func(r *kgo.Record) {
+            var ex example
+            if err := serde.Decode(r.Value, &ex); err != nil {
+                fmt.Fprintf(os.Stderr, "unable to decode record value: %v\n", err)
+                os.Exit(1)
+            }
+            fmt.Printf("Consumed example: %+v, sleeping 1s\n", ex)
+        })
+        time.Sleep(time.Second)
+    }
+}
+```
+
+## Protobuf schemas
+
+For Protobuf, use `sr.TypeProtobuf` when registering and wrap your `proto.Marshal` / `proto.Unmarshal` calls. Because a single Protobuf schema can define multiple message types, use the `sr.Index` encoding option to specify which message index within the schema to use:
+
+```go
+serde.Register(
+    ss.ID,
+    &mypb.MyMessage{},
+    sr.Index(0), // index of this message type within the schema
+    sr.EncodeFn(func(v any) ([]byte, error) {
+        return proto.Marshal(v.(proto.Message))
+    }),
+    sr.DecodeFn(func(b []byte, v any) error {
+        return proto.Unmarshal(b, v.(proto.Message))
+    }),
+)
+```
+
+<Note>
+  The `sr.Index` option is required for Protobuf schemas. For Avro, you can omit it.
+</Note>
+
+## Testing with srfake
+
+The `sr` package includes an `srfake` sub-package that provides an in-memory schema registry server for testing. It implements the same HTTP API as Confluent Schema Registry, so your `sr.Client` connects without modification:
+
+```go
+import "github.com/twmb/franz-go/pkg/sr/srfake"
+
+fakeRegistry := srfake.New()
+defer fakeRegistry.Close()
+
+rcl, err := sr.NewClient(sr.URLs(fakeRegistry.URL()))
+```
+
+<Tip>
+  Pair `srfake` with `kfake` to write fully self-contained integration tests that cover both your Kafka produce/consume logic and schema encoding — all without any external services.
+</Tip>
+
+## Fetching an existing schema by ID
+
+If you already know the schema ID (for example, from a side channel or a config value), fetch the schema directly:
+
+```go
+schema, err := rcl.SchemaByID(context.Background(), 42)
+if err != nil {
+    log.Fatal(err)
+}
+fmt.Println("fetched schema:", schema.Schema)
+```

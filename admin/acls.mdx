@@ -1,0 +1,304 @@
+---
+title: 'Manage Kafka ACLs with the kadm package'
+description: 'Grant, list, and revoke Kafka ACL permissions for topics, consumer groups, and the cluster using the kadm ACLBuilder pattern in Go.'
+keywords: ['kafka', 'acl', 'kadm', 'permissions', 'authorization', 'franz-go', 'security']
+---
+
+Kafka ACLs (Access Control Lists) define which principals can perform which operations on which resources. The `kadm` package provides an `ACLBuilder` type that lets you compose ACL rules in a fluent style before creating, describing, or deleting them in a single batch request. Every ACL has five components: a principal (user), a host, a resource (topic name, group ID, etc.), an operation (read, write, etc.), and a permission type (allow or deny).
+
+## ACL concepts
+
+<AccordionGroup>
+  <Accordion title="Resource types">
+    Kafka ACLs can be attached to these resource types, exposed as constants in `kadm`:
+
+    | kadm method | Kafka resource |
+    |---|---|
+    | `.Topics("name")` | Topic |
+    | `.Groups("name")` | Consumer group |
+    | `.Clusters()` | Cluster (`kafka-cluster`) |
+    | `.TransactionalIDs("id")` | Transactional ID |
+    | `.DelegationTokens("token")` | Delegation token |
+
+    Calling any of these methods with no arguments (e.g., `.Topics()`) matches all resources of that type when listing or deleting.
+  </Accordion>
+  <Accordion title="Operations">
+    The `ACLOperation` constants correspond to Kafka ACL operations:
+
+    | Constant | Operation |
+    |---|---|
+    | `kadm.OpRead` | READ |
+    | `kadm.OpWrite` | WRITE |
+    | `kadm.OpCreate` | CREATE |
+    | `kadm.OpDelete` | DELETE |
+    | `kadm.OpAlter` | ALTER |
+    | `kadm.OpDescribe` | DESCRIBE |
+    | `kadm.OpDescribeConfigs` | DESCRIBE\_CONFIGS |
+    | `kadm.OpAlterConfigs` | ALTER\_CONFIGS |
+    | `kadm.OpAll` | ALL (shortcut for granting all operations) |
+    | `kadm.OpAny` | ANY (used for listing/deleting filters only) |
+  </Accordion>
+  <Accordion title="Resource patterns">
+    ACL resource names can be matched in different ways using the `ACLPattern` constants:
+
+    | Constant | Meaning |
+    |---|---|
+    | `kadm.ACLPatternLiteral` | Exact name match (default) |
+    | `kadm.ACLPatternPrefixed` | Matches all resources whose name starts with the given prefix |
+    | `kadm.ACLPatternAny` | Matches any pattern (listing/deleting only) |
+    | `kadm.ACLPatternMatch` | Matches literal, prefix, and wildcard (listing/deleting only) |
+  </Accordion>
+  <Accordion title="Principal format">
+    With the Kafka simple authorizer (and most reimplementations), principals must have the `"User:"` prefix. Call `PrefixUser()` on your builder to add it automatically to all principals that are missing it:
+
+    ```go
+    b := kadm.NewACLs().
+        Allow("alice", "bob").
+        Topics("orders").
+        Operations(kadm.OpRead)
+    b.PrefixUser() // alice -> User:alice, bob -> User:bob
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## The ACLBuilder pattern
+
+Every ACL operation in `kadm` starts with `kadm.NewACLs()` which returns an `*ACLBuilder`. You chain methods on the builder to set the resource, principals, hosts, and operations, then pass it to `CreateACLs`, `DescribeACLs`, or `DeleteACLs`. The builder multiplies every combination of principal × host × resource × operation into individual ACL entries.
+
+## Creating ACLs
+
+```go
+// Allow User:alice to read from and commit to topic "orders" from any host.
+b := kadm.NewACLs().
+    Topics("orders").
+    Allow("User:alice").
+    Operations(kadm.OpRead, kadm.OpDescribe)
+
+results, err := adm.CreateACLs(ctx, b)
+if err != nil {
+    log.Fatal(err)
+}
+for _, r := range results {
+    if r.Err != nil {
+        log.Printf("create acl error: %v (msg: %s)", r.Err, r.ErrMessage)
+        continue
+    }
+    fmt.Printf("created: %s %s on %s %s\n",
+        r.Permission, r.Operation, r.Type, r.Name)
+}
+```
+
+### Granting access to a consumer group
+
+A consumer needs READ on the topic *and* READ on the group to commit offsets:
+
+```go
+b := kadm.NewACLs().
+    Topics("orders").
+    Groups("my-consumer-group").
+    Allow("User:alice").
+    Operations(kadm.OpRead, kadm.OpDescribe)
+
+_, err := adm.CreateACLs(ctx, b)
+```
+
+### Prefixed ACLs for topic namespacing
+
+A prefixed pattern allows a single ACL to cover all topics matching a prefix. This avoids adding a new ACL every time a new topic is created under that namespace:
+
+```go
+b := kadm.NewACLs().
+    Topics("payments-").  // covers payments-orders, payments-refunds, etc.
+    ResourcePatternType(kadm.ACLPatternPrefixed).
+    Allow("User:payments-service").
+    Operations(kadm.OpRead, kadm.OpWrite, kadm.OpDescribe)
+
+_, err := adm.CreateACLs(ctx, b)
+```
+
+### Cluster-level ACLs
+
+Certain operations such as creating topics automatically or listing all groups require cluster-level permissions:
+
+```go
+b := kadm.NewACLs().
+    Clusters().
+    Allow("User:admin").
+    Operations(kadm.OpDescribe, kadm.OpAlter)
+
+_, err := adm.CreateACLs(ctx, b)
+```
+
+### Deny ACLs
+
+You can add explicit deny rules alongside or instead of allow rules:
+
+```go
+b := kadm.NewACLs().
+    Topics("internal-audit").
+    Deny("User:external-service").
+    Operations(kadm.OpAll)
+
+_, err := adm.CreateACLs(ctx, b)
+```
+
+<Note>
+When creating ACLs, if you specify `Allow` or `Deny` principals but do not specify hosts with `AllowHosts` or `DenyHosts`, the host defaults to the wildcard `*`, granting or denying access from all hosts.
+</Note>
+
+## Describing (listing) ACLs
+
+`DescribeACLs` returns all ACLs matching the builder's filter. Calling resource methods with no arguments (e.g., `.Topics()`) matches all ACLs of that resource type. Use `OpAny` to match any operation:
+
+```go
+// List all topic ACLs.
+b := kadm.NewACLs().
+    Topics().
+    Allow().AllowHosts().
+    Deny().DenyHosts().
+    Operations(kadm.OpAny)
+
+results, err := adm.DescribeACLs(ctx, b)
+if err != nil {
+    log.Fatal(err)
+}
+for _, result := range results {
+    if result.Err != nil {
+        log.Printf("describe error: %v", result.Err)
+        continue
+    }
+    for _, acl := range result.Described {
+        fmt.Printf("%s: %s %s on %s %s\n",
+            acl.Principal, acl.Permission, acl.Operation, acl.Type, acl.Name)
+    }
+}
+```
+
+To describe all ACLs for a specific user across all resource types:
+
+```go
+b := kadm.NewACLs().
+    AnyResource().
+    Allow("User:alice").AllowHosts().
+    Operations(kadm.OpAny)
+
+results, err := adm.DescribeACLs(ctx, b)
+```
+
+<Tip>
+Run `DescribeACLs` with the same builder before `DeleteACLs` to preview exactly which ACLs will be removed. The two methods use identical filter logic.
+</Tip>
+
+## Deleting ACLs
+
+`DeleteACLs` removes all ACLs that match the filter. Each result entry contains a `Deleted` slice listing the ACLs that were actually removed:
+
+```go
+// Revoke all topic read/describe ACLs for User:alice.
+b := kadm.NewACLs().
+    Topics("orders").
+    Allow("User:alice").AllowHosts().
+    Operations(kadm.OpRead, kadm.OpDescribe)
+
+results, err := adm.DeleteACLs(ctx, b)
+if err != nil {
+    log.Fatal(err)
+}
+for _, result := range results {
+    if result.Err != nil {
+        log.Printf("delete filter error: %v", result.Err)
+        continue
+    }
+    for _, deleted := range result.Deleted {
+        if deleted.Err != nil {
+            log.Printf("acl delete error: %v", deleted.Err)
+            continue
+        }
+        fmt.Printf("deleted: %s %s on %s %s\n",
+            deleted.Permission, deleted.Operation, deleted.Type, deleted.Name)
+    }
+}
+```
+
+To delete all ACLs for a specific user across every resource type, use `AnyResource` combined with `OpAny`:
+
+```go
+b := kadm.NewACLs().
+    AnyResource().
+    Allow("User:departed-employee").AllowHosts().
+    Deny("User:departed-employee").DenyHosts().
+    Operations(kadm.OpAny)
+
+_, err := adm.DeleteACLs(ctx, b)
+```
+
+<Warning>
+ACL deletion is broad by default. Use `HasAnyFilter` on your builder to detect if you have accidentally opted into wildcard filters before deleting:
+
+```go
+if b.HasAnyFilter() {
+    log.Fatal("builder has wildcard filters, aborting delete")
+}
+```
+</Warning>
+
+## Complete example: topic producer/consumer setup
+
+The following example creates the minimal set of ACLs needed for a producer to write to a topic and a consumer to read from it:
+
+```go
+package main
+
+import (
+    "context"
+    "log"
+
+    "github.com/twmb/franz-go/pkg/kadm"
+    "github.com/twmb/franz-go/pkg/kgo"
+)
+
+func setupACLs(ctx context.Context, adm *kadm.Client) error {
+    // Producer: needs WRITE and DESCRIBE on the topic.
+    producerACLs := kadm.NewACLs().
+        Topics("orders").
+        Allow("User:producer-service").
+        Operations(kadm.OpWrite, kadm.OpDescribe)
+    producerACLs.PrefixUser()
+
+    if _, err := adm.CreateACLs(ctx, producerACLs); err != nil {
+        return err
+    }
+
+    // Consumer: needs READ and DESCRIBE on the topic,
+    // plus READ on the consumer group.
+    consumerACLs := kadm.NewACLs().
+        Topics("orders").
+        Groups("orders-consumer-group").
+        Allow("User:consumer-service").
+        Operations(kadm.OpRead, kadm.OpDescribe)
+    consumerACLs.PrefixUser()
+
+    if _, err := adm.CreateACLs(ctx, consumerACLs); err != nil {
+        return err
+    }
+
+    return nil
+}
+```
+
+## Validating a builder before use
+
+Call `ValidateCreate()` before `CreateACLs`, or `ValidateFilter()` before `DescribeACLs` / `DeleteACLs`, to catch configuration mistakes early without making a network request:
+
+```go
+b := kadm.NewACLs().
+    Topics("orders").
+    Allow("User:alice")
+    // forgot Operations(...)
+
+if err := b.ValidateCreate(); err != nil {
+    log.Fatalf("invalid ACL builder: %v", err)
+}
+
+_, err := adm.CreateACLs(ctx, b)
+```

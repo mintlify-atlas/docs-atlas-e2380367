@@ -1,0 +1,160 @@
+---
+title: "Install franz-go and optional packages"
+description: "Add the franz-go core client, kadm admin tools, schema registry, kfake test helpers, and observability plugins to your Go module with go get."
+keywords: ["kafka", "go", "install", "franz-go", "kadm", "kmsg", "kfake", "kprom", "kzap", "kotel"]
+---
+
+franz-go is organized as a multi-module repository. The core client is one Go module, and each optional package—admin client, raw protocol types, schema registry, fake broker, and observability plugins—is released as a separate module with its own version tag. This lets you add only what you need and upgrade packages independently.
+
+## Core client
+
+The main Kafka client lives in the `kgo` package inside the `franz-go` root module. This is the only package you need to produce and consume messages:
+
+```bash
+go get github.com/twmb/franz-go
+```
+
+Import the package in your code as:
+
+```go
+import "github.com/twmb/franz-go/pkg/kgo"
+```
+
+## Optional packages
+
+### Admin client (`pkg/kadm`)
+
+`kadm` provides a high-level API for common cluster administration tasks: creating and deleting topics, managing ACLs, describing consumer groups, monitoring lag, and more. Install it alongside the core client:
+
+```bash
+go get github.com/twmb/franz-go/pkg/kadm
+```
+
+```go
+import "github.com/twmb/franz-go/pkg/kadm"
+```
+
+### Raw protocol types (`pkg/kmsg`)
+
+`kmsg` contains code-generated request and response structs for every Kafka protocol message. You only need this package if you want to issue raw protocol requests directly, bypassing the higher-level `kgo` and `kadm` APIs:
+
+```bash
+go get github.com/twmb/franz-go/pkg/kmsg
+```
+
+```go
+import "github.com/twmb/franz-go/pkg/kmsg"
+```
+
+<Note>
+  The core `kgo` module depends on `pkg/kmsg` already, so Go will pull in
+  `kmsg` automatically. You only need to `go get` it explicitly if you import
+  it directly in your own code.
+</Note>
+
+### Schema registry client (`pkg/sr`)
+
+`pkg/sr` provides a Confluent-compatible schema registry client plus a `Serde` type for encoding and decoding Avro, Protobuf, and JSON Schema messages:
+
+```bash
+go get github.com/twmb/franz-go/pkg/sr
+```
+
+```go
+import "github.com/twmb/franz-go/pkg/sr"
+```
+
+### Fake broker for testing (`pkg/kfake`)
+
+`kfake` implements an in-process Kafka broker you can use in unit tests without running a real cluster. It supports the full produce/fetch lifecycle, consumer groups, transactions, and ACLs:
+
+```bash
+go get github.com/twmb/franz-go/pkg/kfake
+```
+
+```go
+import "github.com/twmb/franz-go/pkg/kfake"
+```
+
+<Tip>
+  See `examples/testing_with_kfake` for patterns that demonstrate one-shot
+  error injection, persistent request observation, and coordinated
+  produce-consume synchronization.
+</Tip>
+
+## Observability plugins
+
+Each plugin is a separate module under `plugin/`. Install only the plugins that match your observability stack:
+
+| Plugin | Purpose | Module path |
+|---|---|---|
+| `kprom` | Prometheus metrics via hooks | `github.com/twmb/franz-go/plugin/kprom` |
+| `kzap` | Structured logging with go.uber.org/zap | `github.com/twmb/franz-go/plugin/kzap` |
+| `kzerolog` | Structured logging with zerolog | `github.com/twmb/franz-go/plugin/kzerolog` |
+| `kotel` | OpenTelemetry tracing and metrics | `github.com/twmb/franz-go/plugin/kotel` |
+| `kgmetrics` | Metrics with rcrowley/go-metrics | `github.com/twmb/franz-go/plugin/kgmetrics` |
+| `kslog` | Structured logging with log/slog | `github.com/twmb/franz-go/plugin/kslog` |
+
+Install a plugin with `go get`:
+
+```bash
+go get github.com/twmb/franz-go/plugin/kprom
+go get github.com/twmb/franz-go/plugin/kzap
+go get github.com/twmb/franz-go/plugin/kotel
+```
+
+<Warning>
+  Plugin modules are versioned independently from the core `franz-go` module.
+  A `plugin/kprom@v1.2.0` tag is unrelated to `franz-go@v1.20.7`. Always
+  check each plugin's own release tags when upgrading.
+</Warning>
+
+## Example `go.mod` require section
+
+A typical application that uses the core client, admin package, and a couple of plugins might have a `go.mod` like this:
+
+```
+require (
+    github.com/twmb/franz-go v1.20.7
+    github.com/twmb/franz-go/pkg/kadm v1.17.1
+    github.com/twmb/franz-go/pkg/kmsg v1.12.0
+    github.com/twmb/franz-go/plugin/kprom v1.0.0
+    github.com/twmb/franz-go/plugin/kzap v1.0.0
+)
+```
+
+## Version pinning
+
+By default, `kgo.NewClient` issues an `ApiVersions` request to each broker on first connect and uses the highest protocol version that both sides support. If you need to target an older broker, use the `MaxVersions` option to cap the protocol version:
+
+```go
+import "github.com/twmb/franz-go/pkg/kversion"
+
+cl, err := kgo.NewClient(
+    kgo.SeedBrokers("localhost:9092"),
+    kgo.MaxVersions(kversion.V2_6()),
+)
+```
+
+<Note>
+  Kafka introduced the `ApiVersions` request in v0.10.0. If you target a broker
+  older than that, you must use the `kversions` package and set `MaxVersions`
+  explicitly, otherwise the client cannot negotiate protocol versions automatically.
+</Note>
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Write your first producer and consumer with the core kgo package.
+  </Card>
+  <Card title="Introduction" icon="book-open" href="/introduction">
+    Learn what franz-go is, why to use it, and what KIPs it supports.
+  </Card>
+  <Card title="Producing" icon="upload" href="/concepts/producing">
+    Deep-dive into batching, compression, transactions, and EOS.
+  </Card>
+  <Card title="API reference" icon="code" href="https://pkg.go.dev/github.com/twmb/franz-go/pkg/kgo">
+    Full godoc for every type, option, and method in the kgo package.
+  </Card>
+</CardGroup>

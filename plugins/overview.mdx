@@ -1,0 +1,143 @@
+---
+title: 'franz-go plugin packages for metrics and logging'
+description: 'Extend franz-go with drop-in plugins for Prometheus, OpenTelemetry, go-metrics, and structured logging via Zap, zerolog, logrus, slog, kphuslog, and logr.'
+keywords: ['franz-go', 'kafka', 'plugins', 'metrics', 'logging', 'kprom', 'kotel', 'kzap']
+---
+
+franz-go separates observability concerns from the core client through a hook-based plugin system. The `kgo.Client` exposes a set of interfaces — collectively called hooks — that plugins implement to receive callbacks at key points in the client lifecycle: when connections open or close, when bytes are written or read, when batches are produced or fetched, and more. Because each plugin is an independent Go module, you only pull in what you need.
+
+## How plugins work
+
+Plugins implement one or more hook interfaces from the `kgo` package. You register them when constructing the client using `kgo.WithHooks` (for metrics) or `kgo.WithLogger` (for logging). The client checks at runtime which interfaces each registered hook satisfies and calls only the methods that exist on it — your code is never forced to implement methods it does not need.
+
+```go
+import (
+    "github.com/twmb/franz-go/pkg/kgo"
+    "github.com/twmb/franz-go/plugin/kprom"
+    "github.com/twmb/franz-go/plugin/kzap"
+
+    "go.uber.org/zap"
+)
+
+metrics := kprom.NewMetrics("myapp")
+zapLogger, _ := zap.NewProduction()
+
+cl, err := kgo.NewClient(
+    kgo.SeedBrokers("localhost:9092"),
+    kgo.WithHooks(metrics),
+    kgo.WithLogger(kzap.New(zapLogger)),
+)
+```
+
+Metrics hooks and logging hooks are independent: you can combine any logger with any metrics plugin, or use multiple metrics plugins together.
+
+## Available plugins
+
+Each plugin lives under `github.com/twmb/franz-go/plugin/{name}` and must be installed with a separate `go get` call.
+
+<CardGroup cols={2}>
+  <Card title="kprom" icon="chart-bar" href="/plugins/prometheus">
+    Prometheus metrics exported via an `http.Handler`. Tracks connections, byte counts, produce/fetch throughput, and buffered record gauges. Supports custom registries, histogram timings, and static labels.
+
+    ```bash
+    go get github.com/twmb/franz-go/plugin/kprom
+    ```
+  </Card>
+  <Card title="kotel" icon="telescope" href="/plugins/opentelemetry">
+    OpenTelemetry distributed tracing and metrics. Injects and extracts span context through Kafka record headers so traces flow from producers to consumers across service boundaries.
+
+    ```bash
+    go get github.com/twmb/franz-go/plugin/kotel
+    ```
+  </Card>
+  <Card title="kgmetrics" icon="gauge" href="https://pkg.go.dev/github.com/twmb/franz-go/plugin/kgmetrics">
+    go-metrics drop-in metrics. Registers meters under hierarchical names like `broker.<id>.topic.<topic>.produce_bytes` and works with any go-metrics registry.
+
+    ```bash
+    go get github.com/twmb/franz-go/plugin/kgmetrics
+    ```
+  </Card>
+  <Card title="kvictoria" icon="chart-line" href="https://pkg.go.dev/github.com/twmb/franz-go/plugin/kvictoria">
+    VictoriaMetrics metrics using the `VictoriaMetrics/metrics` library. Covers connections, byte counts, produce/fetch batches, buffered gauges, throttling, and consumer group errors.
+
+    ```bash
+    go get github.com/twmb/franz-go/plugin/kvictoria
+    ```
+  </Card>
+  <Card title="kzap" icon="align-left" href="/plugins/logging">
+    Uber Zap structured logger. Maps kgo log levels to Zap levels and supports static or dynamic level selection via `AtomicLevel`.
+
+    ```bash
+    go get github.com/twmb/franz-go/plugin/kzap
+    ```
+  </Card>
+  <Card title="kzerolog" icon="align-left" href="/plugins/logging">
+    zerolog structured logger. Wraps a `*zerolog.Logger` and maps all kgo log levels to their zerolog equivalents.
+
+    ```bash
+    go get github.com/twmb/franz-go/plugin/kzerolog
+    ```
+  </Card>
+  <Card title="klogrus" icon="align-left" href="/plugins/logging">
+    logrus structured logger. Accepts either `*logrus.Logger` or any custom wrapper that implements `logrus.FieldLogger` with a `GetLevel` method.
+
+    ```bash
+    go get github.com/twmb/franz-go/plugin/klogrus
+    ```
+  </Card>
+  <Card title="kslog" icon="align-left" href="/plugins/logging">
+    Go standard library `log/slog` logger. Requires Go 1.21 or later. Wraps `*slog.Logger` and is the recommended choice for new projects.
+
+    ```bash
+    go get github.com/twmb/franz-go/plugin/kslog
+    ```
+  </Card>
+  <Card title="kphuslog" icon="align-left" href="/plugins/logging">
+    phuslog structured logger. Wraps a `*log.Logger` from `github.com/phuslu/log`.
+
+    ```bash
+    go get github.com/twmb/franz-go/plugin/kphuslog
+    ```
+  </Card>
+  <Card title="klogr" icon="align-left" href="/plugins/logging">
+    logr interface logger. Wraps `logr.Logger` and maps kgo log levels to logr V levels, with a customisable level mapping function.
+
+    ```bash
+    go get github.com/twmb/franz-go/plugin/klogr
+    ```
+  </Card>
+</CardGroup>
+
+## Module path pattern
+
+All plugins follow the module path `github.com/twmb/franz-go/plugin/{name}`. Because each plugin is its own Go module with its own `go.mod`, adding one plugin does not pull in the dependencies of any other. Install only what you use:
+
+```bash
+# Install the Prometheus metrics plugin
+go get github.com/twmb/franz-go/plugin/kprom
+
+# Install the slog logging plugin
+go get github.com/twmb/franz-go/plugin/kslog
+```
+
+## Writing a custom hook
+
+If none of the built-in plugins suit your needs, you can implement the hook interfaces directly. The `kgo.Hook` type is `any`, so any struct that implements one or more hook interfaces qualifies. See the `HookBrokerConnect`, `HookBrokerWrite`, `HookProduceBatchWritten`, and related interfaces in the `kgo` package for the full list of available hooks.
+
+```go
+type myMetrics struct{}
+
+// OnBrokerConnect is called each time the client opens a connection to a broker.
+func (m *myMetrics) OnBrokerConnect(meta kgo.BrokerMetadata, _ time.Duration, _ net.Conn, err error) {
+    if err != nil {
+        // increment an error counter
+        return
+    }
+    // increment a connect counter
+}
+
+cl, err := kgo.NewClient(
+    kgo.SeedBrokers("localhost:9092"),
+    kgo.WithHooks(&myMetrics{}),
+)
+```

@@ -1,0 +1,159 @@
+---
+title: "kmsg package — raw Kafka protocol types"
+description: "API reference for the kmsg package: code-generated request and response types for every Kafka API key, used when kadm does not provide enough control."
+keywords: ["kafka", "kmsg", "protocol", "request", "response", "raw", "franz-go"]
+---
+
+The `kmsg` package contains code-generated structs for every request and response in the Kafka wire protocol. You use it when the high-level `kadm` package does not expose the operation or level of detail you need. Every request type has a `RequestWith` method that issues the request through any `kgo.Client` or `kgo.Broker` and returns a typed response. The package follows strict versioning rules: always use the `New*` constructor functions to initialize request structs so that new fields get their correct default values.
+
+```bash
+go get github.com/twmb/franz-go
+```
+
+```go
+import "github.com/twmb/franz-go/pkg/kmsg"
+```
+
+For the complete auto-generated reference, see [pkg.go.dev/github.com/twmb/franz-go/pkg/kmsg](https://pkg.go.dev/github.com/twmb/franz-go/pkg/kmsg).
+
+---
+
+## When to use kmsg vs kadm
+
+Use `kadm` for everyday admin work: creating topics, managing offsets, describing configs. Use `kmsg` directly when:
+
+- You need fields or request variants that `kadm` does not expose.
+- You want to issue requests to a specific broker rather than the controller or coordinator.
+- You are building tooling that needs access to every field in the Kafka protocol response.
+- You need to issue requests inside `kfake` control functions to simulate specific broker behavior.
+
+---
+
+## Always use New\* constructors
+
+The kmsg package may add new fields when Kafka introduces new protocol versions. A new field that has a non-zero default value will behave incorrectly if you initialize the struct with a Go literal. Always use the constructor:
+
+```go
+// Correct: safe defaults for all fields.
+req := kmsg.NewMetadataRequest()
+req.Topics = nil // fetch metadata for all topics
+
+// Incorrect: new fields with important defaults may be zero-valued.
+req := kmsg.MetadataRequest{}
+```
+
+---
+
+## RequestWith pattern
+
+Every generated request type has a `RequestWith` method that accepts any `kmsg.Requestor`. Both `*kgo.Client` and `*kgo.Broker` implement this interface:
+
+```go
+req := kmsg.NewMetadataRequest()
+resp, err := req.RequestWith(ctx, client)
+if err != nil {
+    log.Fatal(err)
+}
+for _, t := range resp.Topics {
+    fmt.Printf("topic=%s partitions=%d\n", t.Topic, len(t.Partitions))
+}
+```
+
+---
+
+## Issuing requests with kgo.Client
+
+`kgo.Client` provides two methods for raw protocol requests:
+
+| Method | Description |
+|---|---|
+| `cl.Request(ctx, req)` | Issues a request to any broker (or the controller for admin requests). Returns a `kmsg.Response`. |
+| `cl.RequestSharded(ctx, req)` | Splits the request across brokers and returns a `[]kgo.ResponseShard`. Use this for requests that fan out, like `ListOffsets`. |
+
+```go
+req := kmsg.NewListOffsetsRequest()
+req.Topics = []kmsg.ListOffsetsRequestTopic{{
+    Topic: "my-topic",
+    Partitions: []kmsg.ListOffsetsRequestTopicPartition{{
+        Partition: 0,
+        Timestamp: -1, // latest
+    }},
+}}
+
+shards := cl.RequestSharded(ctx, req)
+for _, shard := range shards {
+    if shard.Err != nil {
+        log.Printf("broker %d: %v", shard.Meta.NodeID, shard.Err)
+        continue
+    }
+    resp := shard.Resp.(*kmsg.ListOffsetsResponse)
+    for _, t := range resp.Topics {
+        for _, p := range t.Partitions {
+            fmt.Printf("partition=%d offset=%d\n", p.Partition, p.Offset)
+        }
+    }
+}
+```
+
+---
+
+## Common request types
+
+The table below lists frequently used request types. Browse the [full list on pkg.go.dev](https://pkg.go.dev/github.com/twmb/franz-go/pkg/kmsg).
+
+| Type | Key | Description |
+|---|---|---|
+| `MetadataRequest` | 3 | Fetch topic and partition metadata. |
+| `ProduceRequest` | 0 | Produce records to topics. |
+| `FetchRequest` | 1 | Fetch records from topics. |
+| `ListOffsetsRequest` | 2 | List partition offsets (earliest, latest, or by timestamp). |
+| `CreateTopicsRequest` | 19 | Create topics with configs. |
+| `DeleteTopicsRequest` | 20 | Delete topics. |
+| `DescribeGroupsRequest` | 15 | Describe consumer groups. |
+| `OffsetFetchRequest` | 9 | Fetch committed offsets for a group. |
+| `OffsetCommitRequest` | 8 | Commit offsets for a group. |
+| `DescribeConfigsRequest` | 32 | Describe broker or topic configs. |
+| `AlterConfigsRequest` | 33 | Alter broker or topic configs. |
+| `IncrementalAlterConfigsRequest` | 44 | Incrementally alter configs (Kafka 2.3+). |
+| `CreateACLsRequest` | 30 | Create ACLs. |
+| `DescribeACLsRequest` | 29 | Describe ACLs. |
+| `DeleteACLsRequest` | 31 | Delete ACLs. |
+| `InitProducerIDRequest` | 22 | Initialize a producer ID for idempotent or transactional produce. |
+
+---
+
+## Key constants
+
+Every request type has a corresponding `Key` constant in the `kmsg` package. These constants are most useful when working with `kfake.ControlKey` in tests:
+
+```go
+kmsg.Produce          // Key = 0
+kmsg.Fetch            // Key = 1
+kmsg.ListOffsets      // Key = 2
+kmsg.Metadata         // Key = 3
+kmsg.OffsetCommit     // Key = 8
+kmsg.OffsetFetch      // Key = 9
+kmsg.DescribeGroups   // Key = 15
+kmsg.ApiVersions      // Key = 18
+kmsg.CreateTopics     // Key = 19
+kmsg.DeleteTopics     // Key = 20
+```
+
+The constant `kmsg.MaxKey` holds the highest defined API key.
+
+---
+
+## Core interfaces
+
+| Interface | Description |
+|---|---|
+| `Request` | Implemented by all request types. Provides `Key()`, `MaxVersion()`, `AppendTo()`, `ReadFrom()`, and `ResponseKind()`. |
+| `Response` | Implemented by all response types. Mirror of `Request`. |
+| `Requestor` | Accepts a `Request` and returns a `Response`. Implemented by `*kgo.Client` and `*kgo.Broker`. |
+| `AdminRequest` | Extends `Request`; marks requests that must go to the controller broker. |
+| `GroupCoordinatorRequest` | Extends `Request`; marks requests that must go to a group coordinator. |
+| `TxnCoordinatorRequest` | Extends `Request`; marks requests that must go to a transaction coordinator. |
+
+<Note>
+The `MaxKey` constant and the set of `Key` variables are the authoritative list of API keys. The generated code in `generated.go` defines one `New*` constructor and one `NewPtr*` constructor per request/response type.
+</Note>

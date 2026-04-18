@@ -1,0 +1,150 @@
+---
+title: 'Configure message compression in franz-go'
+description: 'Set producer batch compression with gzip, snappy, lz4, or zstd in franz-go. Learn codec trade-offs, fallback ordering, and the Event Hubs limitation.'
+keywords: ['kafka', 'compression', 'gzip', 'snappy', 'lz4', 'zstd', 'franz-go', 'producer']
+---
+
+Franz-go compresses producer batches using the `ProducerBatchCompression` option, which accepts an ordered list of codecs. The client picks the first codec that the broker supports, so you can express a preference with a safe fallback in a single call. Consumers never need any configuration — decompression is handled automatically based on the codec identifier embedded in each batch.
+
+## Default behavior
+
+By default, franz-go uses snappy compression with a `NoCompression` fallback:
+
+```go
+// This is the default — you do not need to set it explicitly.
+kgo.ProducerBatchCompression(kgo.SnappyCompression(), kgo.NoCompression())
+```
+
+Snappy has been supported since Kafka 0.8.0, so this default is safe for virtually all deployments. If your brokers and all consumers are on Kafka 2.1 or later, you can switch to zstd for a better compression ratio.
+
+## Available codecs
+
+<AccordionGroup>
+  <Accordion title="NoCompression — no overhead, maximum throughput">
+    Disables compression entirely. Use this when your messages are already compressed at the application layer, when bandwidth is not a concern, or when targeting Microsoft Event Hubs (see the warning below).
+
+    ```go
+    cl, err := kgo.NewClient(
+        kgo.SeedBrokers("localhost:9092"),
+        kgo.ProducerBatchCompression(kgo.NoCompression()),
+    )
+    ```
+  </Accordion>
+
+  <Accordion title="GzipCompression — high ratio, higher CPU">
+    Standard gzip. Produces the smallest batches of the four codecs at the cost of more CPU time. Well-suited for bandwidth-constrained environments where compute is cheap.
+
+    ```go
+    cl, err := kgo.NewClient(
+        kgo.SeedBrokers("localhost:9092"),
+        kgo.ProducerBatchCompression(kgo.GzipCompression()),
+    )
+    ```
+
+    You can override the compression level with `WithLevel`:
+
+    ```go
+    kgo.ProducerBatchCompression(kgo.GzipCompression().WithLevel(9)) // maximum compression
+    ```
+  </Accordion>
+
+  <Accordion title="SnappyCompression — fast, low CPU, good ratio">
+    Google's snappy codec prioritises speed over ratio. It is the franz-go default because it has been available since Kafka 0.8.0, adds minimal CPU overhead, and still reduces message size noticeably. Snappy has no configurable level.
+
+    ```go
+    cl, err := kgo.NewClient(
+        kgo.SeedBrokers("localhost:9092"),
+        kgo.ProducerBatchCompression(kgo.SnappyCompression()),
+    )
+    ```
+  </Accordion>
+
+  <Accordion title="Lz4Compression — fastest, moderate ratio">
+    LZ4 is the fastest compressor in the set, making it a good choice when latency is the primary concern and some CPU savings over snappy are welcome. Available since Kafka 0.10.0.
+
+    ```go
+    cl, err := kgo.NewClient(
+        kgo.SeedBrokers("localhost:9092"),
+        kgo.ProducerBatchCompression(kgo.Lz4Compression()),
+    )
+    ```
+  </Accordion>
+
+  <Accordion title="ZstdCompression — best ratio, requires Kafka 2.1+">
+    Zstandard delivers better compression ratios than gzip at similar or lower CPU cost. It is the recommended codec for modern deployments. Brokers must be at least Kafka 2.1, and all consumers must be on a client version that supports zstd decoding.
+
+    ```go
+    cl, err := kgo.NewClient(
+        kgo.SeedBrokers("localhost:9092"),
+        kgo.ProducerBatchCompression(kgo.ZstdCompression()),
+    )
+    ```
+
+    You can also set the compression level:
+
+    ```go
+    kgo.ProducerBatchCompression(kgo.ZstdCompression().WithLevel(3))
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Codec fallback ordering
+
+Pass multiple codecs to `ProducerBatchCompression` to express a preference order. The client uses the first codec in the list that the broker advertises as supported:
+
+```go
+// Prefer zstd; fall back to snappy on older brokers; final fallback is no compression.
+cl, err := kgo.NewClient(
+    kgo.SeedBrokers("localhost:9092"),
+    kgo.ProducerBatchCompression(
+        kgo.ZstdCompression(),
+        kgo.SnappyCompression(),
+        kgo.NoCompression(),
+    ),
+)
+```
+
+This pattern lets you deploy a single binary across a mixed cluster and upgrade codecs on the broker side without coordinating a client release.
+
+## Consumer-side decompression
+
+Consumers do not require any configuration. Franz-go reads the codec type from the batch attributes and decompresses automatically:
+
+```go
+// No compression option needed — decompression is always automatic.
+cl, err := kgo.NewClient(
+    kgo.SeedBrokers("localhost:9092"),
+    kgo.ConsumeTopics("events"),
+)
+if err != nil {
+    log.Fatal(err)
+}
+
+fetches := cl.PollFetches(context.Background())
+fetches.EachRecord(func(r *kgo.Record) {
+    // r.Value is already decompressed.
+    fmt.Printf("key=%s value=%s\n", r.Key, r.Value)
+})
+```
+
+## Codec comparison
+
+| Codec   | Kafka since | Ratio | Speed  | Notes                           |
+|---------|-------------|-------|--------|---------------------------------|
+| none    | 0.8.0       | 1×    | —      | No CPU overhead                 |
+| gzip    | 0.8.0       | best  | slow   | Configurable level              |
+| snappy  | 0.8.0       | good  | fast   | franz-go default                |
+| lz4     | 0.10.0      | good  | fastest| Configurable level              |
+| zstd    | 2.1.0       | better| medium | Best ratio/CPU trade-off        |
+
+## Microsoft Event Hubs
+
+<Warning>
+  Microsoft Event Hubs does not support receiving compressed Kafka batches. If you are targeting Event Hubs, you must disable compression explicitly:
+
+  ```go
+  kgo.ProducerBatchCompression(kgo.NoCompression())
+  ```
+
+  Sending compressed batches to Event Hubs will cause connection resets.
+</Warning>

@@ -1,0 +1,209 @@
+---
+title: "kfake package — in-memory Kafka for testing"
+description: "API reference for kfake: a fully in-memory fake Kafka cluster for unit and integration tests, with support for control hooks, SASL, ACLs, and transactions."
+keywords: ["kafka", "testing", "kfake", "fake broker", "in-memory", "franz-go"]
+---
+
+The `kfake` package provides a fully in-memory Kafka broker cluster that you can spin up in the same process as your tests. It supports producing, consuming, consumer groups, transactions, SASL authentication, ACLs, fetch sessions, and the latest Kafka protocol versions. Because kfake runs in-process, round trips are near-instant and you can intercept any request type with a `ControlKey` function to simulate broker failures, inject errors, or assert protocol behavior.
+
+```bash
+go get github.com/twmb/franz-go/pkg/kfake
+```
+
+```go
+import "github.com/twmb/franz-go/pkg/kfake"
+```
+
+For the complete reference, see [pkg.go.dev/github.com/twmb/franz-go/pkg/kfake](https://pkg.go.dev/github.com/twmb/franz-go/pkg/kfake).
+
+---
+
+## NewCluster
+
+Create a fake cluster with `NewCluster` (or `MustCluster` to panic on error). The cluster starts three brokers by default and listens on random ports.
+
+```go
+cluster, err := kfake.NewCluster(
+    kfake.SeedTopics(3, "my-topic"),
+)
+if err != nil {
+    t.Fatal(err)
+}
+defer cluster.Close()
+
+// Connect a kgo client to the fake cluster.
+cl, err := kgo.NewClient(
+    kgo.SeedBrokers(cluster.ListenAddrs()...),
+)
+```
+
+| Function | Signature | Description |
+|---|---|---|
+| `NewCluster` | `func NewCluster(opts ...Opt) (*Cluster, error)` | Creates a new in-memory Kafka cluster. |
+| `MustCluster` | `func MustCluster(opts ...Opt) *Cluster` | Like `NewCluster` but panics on error. |
+| `ListenAddrs` | `func (c *Cluster) ListenAddrs() []string` | Returns the `host:port` addresses the cluster is listening on. |
+| `Close` | `func (c *Cluster) Close()` | Shuts down all brokers and frees resources. |
+
+---
+
+## Cluster options
+
+Pass options to `NewCluster` to configure the cluster's initial state.
+
+| Option | Description |
+|---|---|
+| `NumBrokers(n int)` | Number of brokers to start. Default is 3. |
+| `SeedTopics(partitions int32, topics ...string)` | Pre-create topics with the given partition count. |
+| `DefaultNumPartitions(n int)` | Partition count used when `SeedTopics` is called with a non-positive partition count. |
+| `AllowAutoTopicCreation()` | Allow metadata requests to create topics on the fly. |
+| `EnableSASL()` | Enable SASL authentication (default user: `admin`/`admin` via SCRAM-SHA-256). |
+| `Superuser(method, user, pass string)` | Add a SASL superuser that bypasses ACL checks. |
+| `User(method, user, pass string, acls ...ACL)` | Add a SASL user with optional seed ACLs. |
+| `EnableACLs()` | Enable ACL checking. |
+| `MaxVersions(v *kversion.Versions)` | Limit the API versions the cluster advertises (simulates older Kafka versions). |
+| `BrokerConfigs(configs map[string]string)` | Set initial broker-level dynamic configs. |
+| `DataDir(dir string)` | Enable on-disk persistence to the given directory. |
+| `TLS(c *tls.Config)` | Enable TLS for the cluster. |
+
+---
+
+## ControlKey — intercepting requests
+
+`ControlKey` registers a function that intercepts all requests for a given API key. This is the primary mechanism for injecting errors, counting requests, or simulating partial broker failures in tests.
+
+```go
+// Intercept the next Fetch request and return an error.
+cluster.ControlKey(kmsg.Fetch, func(req kmsg.Request) (kmsg.Response, error, bool) {
+    return nil, errors.New("simulated fetch failure"), true // handled=true
+})
+```
+
+The callback signature is:
+
+```go
+func(req kmsg.Request) (resp kmsg.Response, err error, handled bool)
+```
+
+- If `handled` is `true`, the cluster sends `resp` back to the client (or closes the connection if `err` is non-nil).
+- If `handled` is `false`, the cluster processes the request normally. This allows you to observe requests without intercepting them.
+- A control function is consumed after one use. Call `KeepControl()` inside the callback to keep it active for subsequent requests.
+
+```go
+var fetchCount int
+cluster.ControlKey(kmsg.Fetch, func(req kmsg.Request) (kmsg.Response, error, bool) {
+    cluster.KeepControl() // stay registered
+    fetchCount++
+    return nil, nil, false // let the cluster handle it normally
+})
+```
+
+| Method | Description |
+|---|---|
+| `ControlKey(key int16, fn)` | Registers an intercept for a specific API key. |
+| `Control(fn)` | Registers an intercept for all request keys (key -1). |
+| `KeepControl()` | Call inside a control function to prevent it from being removed after handling. |
+| `DropControl()` | Call inside a control function to force removal even if `KeepControl` was set. |
+| `SleepControl(wakeup func())` | Yields execution inside a control function until `wakeup` returns. |
+| `CurrentNode() int32` | Returns the broker node ID that received the current request. |
+
+---
+
+## Common kmsg key constants
+
+Use these constants as the `key` argument to `ControlKey`:
+
+```go
+kmsg.Produce          // 0  - produce records
+kmsg.Fetch            // 1  - fetch records
+kmsg.Metadata         // 3  - topic/broker metadata
+kmsg.OffsetCommit     // 8  - commit consumer group offsets
+kmsg.OffsetFetch      // 9  - fetch consumer group offsets
+kmsg.JoinGroup        // 11 - join a consumer group
+kmsg.Heartbeat        // 12 - consumer group heartbeat
+kmsg.LeaveGroup       // 13 - leave a consumer group
+kmsg.SyncGroup        // 14 - sync a consumer group
+kmsg.ApiVersions      // 18 - API version negotiation
+kmsg.CreateTopics     // 19 - create topics
+kmsg.DeleteTopics     // 20 - delete topics
+kmsg.InitProducerID   // 22 - idempotent/transactional producer ID
+kmsg.EndTxn           // 26 - commit or abort a transaction
+kmsg.DescribeConfigs  // 32 - describe topic/broker configs
+```
+
+---
+
+## Administrative helpers
+
+These methods let you simulate cluster events from within a test without going through the Kafka protocol.
+
+| Method | Description |
+|---|---|
+| `MoveTopicPartition(topic, partition, nodeID)` | Moves a partition's leader to a different broker. |
+| `ShufflePartitionLeaders()` | Randomly reassigns all partition leaders and bumps their epochs. |
+| `AddNode(nodeID, port)` | Adds a new broker to the running cluster. |
+| `RemoveNode(nodeID)` | Removes a broker from the running cluster. |
+| `RehashCoordinators()` | Forces all group and transaction coordinators to be relocated. |
+| `CoordinatorFor(key string) int32` | Returns the coordinator node ID for a group or transaction ID. |
+| `LeaderFor(topic string, partition int32) int32` | Returns the leader node ID for a partition. |
+
+---
+
+## Full test example
+
+<Steps>
+  <Step title="Create the cluster and a client">
+
+```go
+func TestMyConsumer(t *testing.T) {
+    cluster, err := kfake.NewCluster(
+        kfake.SeedTopics(1, "events"),
+    )
+    if err != nil {
+        t.Fatal(err)
+    }
+    defer cluster.Close()
+
+    cl, err := kgo.NewClient(
+        kgo.SeedBrokers(cluster.ListenAddrs()...),
+        kgo.ConsumerGroup("test-group"),
+        kgo.ConsumeTopics("events"),
+    )
+    if err != nil {
+        t.Fatal(err)
+    }
+    defer cl.Close()
+```
+
+  </Step>
+  <Step title="Produce test records">
+
+```go
+    // Produce one record.
+    if err := cl.ProduceSync(ctx,
+        &kgo.Record{Topic: "events", Value: []byte("test")},
+    ).FirstErr(); err != nil {
+        t.Fatal(err)
+    }
+```
+
+  </Step>
+  <Step title="Intercept and verify a Fetch request">
+
+```go
+    var fetchSeen bool
+    cluster.ControlKey(kmsg.Fetch, func(req kmsg.Request) (kmsg.Response, error, bool) {
+        fetchSeen = true
+        return nil, nil, false // let the cluster handle it
+    })
+
+    fetches := cl.PollFetches(ctx)
+    if err := fetches.Err(); err != nil {
+        t.Fatal(err)
+    }
+    if !fetchSeen {
+        t.Error("expected a Fetch request")
+    }
+```
+
+  </Step>
+</Steps>

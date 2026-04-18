@@ -1,0 +1,227 @@
+---
+title: "sasl package — SASL authentication mechanisms"
+description: "API reference for the sasl sub-packages: PLAIN, SCRAM-SHA-256/512, OAUTHBEARER, and Kerberos mechanisms to pass to kgo.SASL() for Kafka authentication."
+keywords: ["kafka", "sasl", "plain", "scram", "kerberos", "oauth", "authentication", "franz-go"]
+---
+
+The `sasl` package defines the `Mechanism` interface that all SASL authentication implementations satisfy. Sub-packages provide concrete mechanisms: `plain` for username/password, `scram` for SCRAM-SHA-256 and SCRAM-SHA-512, `oauth` for OAUTHBEARER tokens, and `kerberos` for Kerberos v5 (GSSAPI). You pass one or more mechanisms to `kgo.SASL()` when creating a client.
+
+Each mechanism package is a separate import path. You only need to import the ones you use.
+
+---
+
+## Mechanism interface
+
+The `sasl.Mechanism` interface is defined in the base package:
+
+```go
+// github.com/twmb/franz-go/pkg/sasl
+type Mechanism interface {
+    Name() string
+    Authenticate(ctx context.Context, host string) (Session, []byte, error)
+}
+```
+
+Every `Auth` struct in the sub-packages has an `AsMechanism()` method (or variant) that returns a `sasl.Mechanism` suitable for passing to `kgo.SASL()`.
+
+---
+
+## PLAIN
+
+Import path: `github.com/twmb/franz-go/pkg/sasl/plain`
+
+```go
+import "github.com/twmb/franz-go/pkg/sasl/plain"
+
+cl, err := kgo.NewClient(
+    kgo.SeedBrokers("localhost:9092"),
+    kgo.SASL(plain.Auth{
+        User: "alice",
+        Pass: "secret",
+    }.AsMechanism()),
+)
+```
+
+```go
+type Auth struct {
+    Zid  string // optional authorization ID
+    User string
+    Pass string
+}
+
+func (a Auth) AsMechanism() sasl.Mechanism
+```
+
+For live-rotating credentials, use `plain.Plain(authFn func(context.Context) (Auth, error))`. The function is called before each new SASL session.
+
+```go
+kgo.SASL(plain.Plain(func(ctx context.Context) (plain.Auth, error) {
+    creds := fetchCredentialsFromVault(ctx)
+    return plain.Auth{User: creds.User, Pass: creds.Pass}, nil
+}))
+```
+
+---
+
+## SCRAM — SHA-256 and SHA-512
+
+Import path: `github.com/twmb/franz-go/pkg/sasl/scram`
+
+```go
+import "github.com/twmb/franz-go/pkg/sasl/scram"
+
+// SCRAM-SHA-256
+cl, err := kgo.NewClient(
+    kgo.SeedBrokers("localhost:9092"),
+    kgo.SASL(scram.Auth{
+        User: "alice",
+        Pass: "secret",
+    }.AsSha256Mechanism()),
+)
+
+// SCRAM-SHA-512
+kgo.SASL(scram.Auth{
+    User: "alice",
+    Pass: "secret",
+}.AsSha512Mechanism())
+```
+
+```go
+type Auth struct {
+    Zid     string  // optional authorization ID
+    User    string
+    Pass    string
+    Nonce   []byte  // optional; 20 random bytes used if empty
+    IsToken bool    // set true when using delegation tokens
+}
+
+func (a Auth) AsSha256Mechanism() sasl.Mechanism
+func (a Auth) AsSha512Mechanism() sasl.Mechanism
+```
+
+For live-rotating credentials, use `scram.Sha256(authFn)` or `scram.Sha512(authFn)`:
+
+```go
+kgo.SASL(scram.Sha256(func(ctx context.Context) (scram.Auth, error) {
+    creds := fetchCredentialsFromVault(ctx)
+    return scram.Auth{User: creds.User, Pass: creds.Pass}, nil
+}))
+```
+
+---
+
+## OAUTHBEARER
+
+Import path: `github.com/twmb/franz-go/pkg/sasl/oauth`
+
+```go
+import "github.com/twmb/franz-go/pkg/sasl/oauth"
+
+cl, err := kgo.NewClient(
+    kgo.SeedBrokers("localhost:9092"),
+    kgo.SASL(oauth.Auth{
+        Token: "my-jwt-token",
+    }.AsMechanism()),
+)
+```
+
+```go
+type Auth struct {
+    Zid        string            // optional authorization ID
+    Token      string            // the OAUTHBEARER token
+    Extensions map[string]string // optional key-value extensions
+}
+
+func (a Auth) AsMechanism() sasl.Mechanism
+```
+
+For tokens that expire and need refreshing, use `oauth.Oauth(authFn func(context.Context) (Auth, error))`. The function is called before each SASL session, giving you the opportunity to fetch a fresh token:
+
+```go
+kgo.SASL(oauth.Oauth(func(ctx context.Context) (oauth.Auth, error) {
+    token, err := tokenSource.Token(ctx)
+    if err != nil {
+        return oauth.Auth{}, err
+    }
+    return oauth.Auth{Token: token.AccessToken}, nil
+}))
+```
+
+---
+
+## Kerberos (GSSAPI)
+
+Import path: `github.com/twmb/franz-go/pkg/sasl/kerberos`
+
+<Note>
+The `kerberos` package is in a separate Go module at `github.com/twmb/franz-go/pkg/sasl/kerberos`. Add it with:
+
+```bash
+go get github.com/twmb/franz-go/pkg/sasl/kerberos
+```
+</Note>
+
+```go
+import (
+    "github.com/jcmturner/gokrb5/v8/client"
+    "github.com/jcmturner/gokrb5/v8/config"
+    "github.com/twmb/franz-go/pkg/sasl/kerberos"
+)
+
+krb5cfg, _ := config.Load("/etc/krb5.conf")
+krb5cl := client.NewWithPassword("alice", "EXAMPLE.COM", "password", krb5cfg)
+_ = krb5cl.Login()
+
+cl, err := kgo.NewClient(
+    kgo.SeedBrokers("localhost:9092"),
+    kgo.SASL(kerberos.Auth{
+        Client:  krb5cl,
+        Service: "kafka",
+    }.AsMechanism()),
+)
+```
+
+```go
+type Auth struct {
+    Client           *client.Client          // Kerberos client; ignored if ClientFn is set
+    ClientFn         func(context.Context) *client.Client // called per session
+    Service          string                  // service name (e.g. "kafka")
+    PersistAfterAuth bool                    // keep client alive after authentication
+}
+
+func (a Auth) AsMechanism() sasl.Mechanism
+func (a Auth) AsMechanismWithClose() sasl.Mechanism // closes the Kerberos client when the kgo.Client closes
+```
+
+---
+
+## Using multiple mechanisms
+
+`kgo.SASL` is variadic. You can provide multiple mechanisms; the client will attempt each in order during broker negotiation:
+
+```go
+cl, err := kgo.NewClient(
+    kgo.SeedBrokers("localhost:9092"),
+    kgo.SASL(
+        scram.Auth{User: "alice", Pass: "secret"}.AsSha512Mechanism(),
+        scram.Auth{User: "alice", Pass: "secret"}.AsSha256Mechanism(),
+    ),
+)
+```
+
+---
+
+## Passing mechanisms to kgo.Client
+
+All mechanisms satisfy `sasl.Mechanism` and are passed directly to `kgo.SASL`:
+
+```go
+kgo.SASL(mechanism)           // single mechanism
+kgo.SASL(m1, m2, m3)          // multiple mechanisms tried in order
+```
+
+The `kgo.SASL` option is defined as:
+
+```go
+func SASL(sasls ...sasl.Mechanism) Opt
+```

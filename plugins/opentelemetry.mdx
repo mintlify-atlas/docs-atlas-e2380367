@@ -1,0 +1,287 @@
+---
+title: 'OpenTelemetry tracing and metrics with kotel'
+description: 'Add OpenTelemetry tracing and metrics to franz-go with kotel: propagate span context through Kafka record headers and collect broker-level counters.'
+keywords: ['kotel', 'opentelemetry', 'franz-go', 'kafka tracing', 'otel kafka go']
+---
+
+The `kotel` package instruments franz-go with OpenTelemetry distributed tracing and metrics. On the tracing side, kotel automatically starts and ends spans as records flow through the client, injecting span context into Kafka record headers when producing and extracting it when consuming — so a trace that begins in an HTTP handler can continue seamlessly into a downstream consumer. On the metrics side, kotel tracks connections, byte counts, and produce/fetch throughput using the OpenTelemetry metrics API.
+
+## Installation
+
+```bash
+go get github.com/twmb/franz-go/plugin/kotel
+```
+
+## Core concepts
+
+kotel is built around three types:
+
+- **`kotel.Tracer`** — implements the tracing hooks. Starts "publish" spans when a record is buffered for produce and "receive" spans when a record is fetched. Span context is propagated through record headers using a `TextMapPropagator`.
+- **`kotel.Meter`** — implements the metrics hooks. Tracks connections, byte counts, and produce/fetch throughput as OpenTelemetry counters.
+- **`kotel.Kotel`** — the top-level container. Holds a `Tracer` and/or `Meter` and exposes a `Hooks()` method that returns the list of `kgo.Hook` values to pass to `kgo.WithHooks`.
+
+## Setup
+
+<Steps>
+  <Step title="Initialize your OTel providers">
+    Create your tracer and meter providers using the OpenTelemetry SDK. The example below uses stdout exporters for illustration; in production you would connect to a collector.
+
+    ```go
+    import (
+        "go.opentelemetry.io/otel/exporters/stdout/stdouttrace"
+        "go.opentelemetry.io/otel/exporters/stdout/stdoutmetric"
+        sdktrace "go.opentelemetry.io/otel/sdk/trace"
+        sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+    )
+
+    traceExporter, _ := stdouttrace.New(stdouttrace.WithPrettyPrint())
+    tracerProvider := sdktrace.NewTracerProvider(
+        sdktrace.WithBatcher(traceExporter),
+        sdktrace.WithSampler(sdktrace.AlwaysSample()),
+    )
+    defer tracerProvider.Shutdown(context.Background())
+
+    metricExporter, _ := stdoutmetric.New()
+    meterProvider := sdkmetric.NewMeterProvider(
+        sdkmetric.WithReader(sdkmetric.NewPeriodicReader(metricExporter)),
+    )
+    defer meterProvider.Shutdown(context.Background())
+    ```
+  </Step>
+  <Step title="Create a kotel Tracer">
+    Provide your tracer provider and a propagator. `propagation.TraceContext{}` carries the W3C Trace Context header format.
+
+    ```go
+    import (
+        "go.opentelemetry.io/otel/propagation"
+        "github.com/twmb/franz-go/plugin/kotel"
+    )
+
+    tracer := kotel.NewTracer(
+        kotel.TracerProvider(tracerProvider),
+        kotel.TracerPropagator(propagation.NewCompositeTextMapPropagator(
+            propagation.TraceContext{},
+        )),
+    )
+    ```
+  </Step>
+  <Step title="Create a kotel Meter">
+    Provide your meter provider. If you omit the option, kotel uses the global meter provider.
+
+    ```go
+    meter := kotel.NewMeter(
+        kotel.MeterProvider(meterProvider),
+    )
+    ```
+  </Step>
+  <Step title="Build the Kotel service and attach it to the client">
+    Combine the tracer and meter into a `Kotel` value and pass its hooks to `kgo.WithHooks`.
+
+    ```go
+    kotelService := kotel.NewKotel(
+        kotel.WithTracer(tracer),
+        kotel.WithMeter(meter),
+    )
+
+    cl, err := kgo.NewClient(
+        kgo.SeedBrokers("localhost:9092"),
+        kgo.WithHooks(kotelService.Hooks()...),
+    )
+    ```
+  </Step>
+</Steps>
+
+## Trace propagation
+
+kotel propagates span context through Kafka record headers automatically. You do not need to modify the record manually.
+
+### Producing with a parent span
+
+Pass a traced context when calling `Produce`. kotel picks up the span from that context and injects it into the record's headers before the record leaves the client.
+
+```go
+func httpHandler(w http.ResponseWriter, r *http.Request) {
+    ctx, span := tracer.Start(r.Context(), "request",
+        trace.WithSpanKind(trace.SpanKindServer),
+    )
+    defer span.End()
+
+    record := &kgo.Record{Topic: "orders", Value: []byte("order-data")}
+    var wg sync.WaitGroup
+    wg.Add(1)
+    cl.Produce(ctx, record, func(_ *kgo.Record, err error) {
+        defer wg.Done()
+        if err != nil {
+            span.SetStatus(codes.Error, err.Error())
+            span.RecordError(err)
+        }
+    })
+    wg.Wait()
+}
+```
+
+### Consuming and processing
+
+When a record is fetched, kotel extracts the span context from its headers and starts a "receive" span as a child of the upstream producer span. To add a "process" span for your own processing logic, call `tracer.WithProcessSpan` at the start of each record's processing loop.
+
+```go
+func processRecord(record *kgo.Record, tracer *kotel.Tracer) {
+    ctx, span := tracer.WithProcessSpan(record)
+    defer span.End()
+
+    // ctx carries the active span; pass it to any downstream calls
+    fmt.Printf("processing offset %d from topic %s\n", record.Offset, record.Topic)
+    _ = ctx
+}
+```
+
+### Span lifecycle
+
+| Order | Event | Span operation | Action |
+|---|---|---|---|
+| 1 | `HookProduceRecordBuffered` | publish | Start — context injected into record headers |
+| 2 | `HookProduceRecordUnbuffered` | publish | End — partition attribute added, errors recorded |
+| 3 | `HookFetchRecordBuffered` | receive | Start — context extracted from record headers |
+| 4 | `HookFetchRecordUnbuffered` | receive | End |
+| 5 | `kotel.Tracer.WithProcessSpan` | process | Start — you call this; you end the span |
+
+### Linking instead of parenting
+
+By default, consumer spans are created as children of the producer span. If you prefer to keep them as separate root spans with a link to the producer span, use `kotel.LinkSpans()`:
+
+```go
+tracer := kotel.NewTracer(
+    kotel.TracerProvider(tracerProvider),
+    kotel.LinkSpans(),
+)
+```
+
+### Consumer group and client ID attributes
+
+```go
+tracer := kotel.NewTracer(
+    kotel.TracerProvider(tracerProvider),
+    kotel.ClientID("my-service"),
+    kotel.ConsumerGroup("my-consumer-group"),
+)
+```
+
+## Metrics collected
+
+The kotel meter tracks these OpenTelemetry counters, all labeled with `node_id` and, where applicable, `topic`:
+
+| Metric name | Unit | Description |
+|---|---|---|
+| `messaging.kafka.connects.count` | 1 | Broker connections opened |
+| `messaging.kafka.connect_errors.count` | 1 | Broker connection failures |
+| `messaging.kafka.disconnects.count` | 1 | Broker connections closed |
+| `messaging.kafka.write_errors.count` | 1 | Write errors per broker |
+| `messaging.kafka.write_bytes` | bytes | Bytes written per broker |
+| `messaging.kafka.read_errors.count` | 1 | Read errors per broker |
+| `messaging.kafka.read_bytes.count` | bytes | Bytes read per broker |
+| `messaging.kafka.produce_bytes.count` | bytes | Uncompressed bytes produced per broker and topic |
+| `messaging.kafka.produce_records.count` | 1 | Records produced per broker and topic |
+| `messaging.kafka.fetch_bytes.count` | bytes | Uncompressed bytes fetched per broker and topic |
+| `messaging.kafka.fetch_records.count` | 1 | Records fetched per broker and topic |
+
+<Tip>
+You can use either `WithTracer` or `WithMeter` independently — you do not need both. If you only want tracing, omit the meter, and vice versa.
+</Tip>
+
+### Merging connect counters
+
+By default, successful connects and connection errors are separate counters. If you prefer a single metric with an `outcome` attribute (useful for alerting when the metric stops producing data), enable `WithMergedConnectsMeter`:
+
+```go
+meter := kotel.NewMeter(
+    kotel.MeterProvider(meterProvider),
+    kotel.WithMergedConnectsMeter(),
+)
+```
+
+This produces `messaging.kafka.connects.count{node_id="...", outcome="success"}` and `messaging.kafka.connects.count{node_id="...", outcome="failure"}` instead of two separate counters.
+
+## Complete example
+
+The following is condensed from `examples/plugin_kotel/main.go` in the franz-go repository:
+
+```go
+package main
+
+import (
+    "context"
+    "fmt"
+    "log"
+    "sync"
+
+    "go.opentelemetry.io/otel/codes"
+    "go.opentelemetry.io/otel/exporters/stdout/stdoutmetric"
+    "go.opentelemetry.io/otel/exporters/stdout/stdouttrace"
+    "go.opentelemetry.io/otel/propagation"
+    sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+    sdktrace "go.opentelemetry.io/otel/sdk/trace"
+    "go.opentelemetry.io/otel/trace"
+
+    "github.com/twmb/franz-go/pkg/kgo"
+    "github.com/twmb/franz-go/plugin/kotel"
+)
+
+func main() {
+    // Set up providers (stdout for demo; use OTLP in production).
+    traceExp, _ := stdouttrace.New(stdouttrace.WithPrettyPrint())
+    tp := sdktrace.NewTracerProvider(
+        sdktrace.WithBatcher(traceExp),
+        sdktrace.WithSampler(sdktrace.AlwaysSample()),
+    )
+    defer tp.Shutdown(context.Background())
+
+    metricExp, _ := stdoutmetric.New()
+    mp := sdkmetric.NewMeterProvider(
+        sdkmetric.WithReader(sdkmetric.NewPeriodicReader(metricExp)),
+    )
+    defer mp.Shutdown(context.Background())
+
+    // Build kotel components.
+    kotelTracer := kotel.NewTracer(
+        kotel.TracerProvider(tp),
+        kotel.TracerPropagator(propagation.NewCompositeTextMapPropagator(
+            propagation.TraceContext{},
+        )),
+    )
+    kotelMeter := kotel.NewMeter(kotel.MeterProvider(mp))
+    kotelService := kotel.NewKotel(
+        kotel.WithTracer(kotelTracer),
+        kotel.WithMeter(kotelMeter),
+    )
+
+    // Create the Kafka client.
+    cl, err := kgo.NewClient(
+        kgo.SeedBrokers("localhost:9092"),
+        kgo.WithHooks(kotelService.Hooks()...),
+    )
+    if err != nil {
+        log.Fatal(err)
+    }
+    defer cl.Close()
+
+    // Produce with a parent span.
+    requestTracer := tp.Tracer("request-service")
+    ctx, span := requestTracer.Start(context.Background(), "request",
+        trace.WithSpanKind(trace.SpanKindServer),
+    )
+    defer span.End()
+
+    var wg sync.WaitGroup
+    wg.Add(1)
+    record := &kgo.Record{Topic: "topic", Key: []byte("key"), Value: []byte("value")}
+    cl.Produce(ctx, record, func(_ *kgo.Record, err error) {
+        defer wg.Done()
+        if err != nil {
+            span.SetStatus(codes.Error, err.Error())
+            span.RecordError(err)
+            fmt.Printf("produce error: %v\n", err)
+        }
+    })
+    wg.Wait()
+}
+```

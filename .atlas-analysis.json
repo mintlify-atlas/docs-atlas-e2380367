@@ -1,0 +1,112 @@
+{
+  "projectType": "sdk-library",
+  "projectName": "franz-go",
+  "projectDescription": "A feature-complete, pure Go Kafka client supporting all Kafka versions from 0.8.0 through 4.1+, with full support for producing, consuming, transactions, and cluster administration.",
+  "theme": "luma",
+  "primaryColor": "#94cb04",
+  "lightColor": "#545454",
+  "darkColor": null,
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "quickstart",
+              "installation"
+            ]
+          },
+          {
+            "group": "Core Concepts",
+            "pages": [
+              "concepts/producing",
+              "concepts/consuming",
+              "concepts/transactions",
+              "concepts/error-handling"
+            ]
+          },
+          {
+            "group": "Guides",
+            "pages": [
+              "guides/authentication",
+              "guides/compression",
+              "guides/metrics-and-logging",
+              "guides/testing",
+              "guides/schema-registry"
+            ]
+          },
+          {
+            "group": "Administration",
+            "pages": [
+              "admin/overview",
+              "admin/topics",
+              "admin/consumer-groups",
+              "admin/acls"
+            ]
+          },
+          {
+            "group": "Plugins",
+            "pages": [
+              "plugins/overview",
+              "plugins/prometheus",
+              "plugins/opentelemetry",
+              "plugins/logging"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "groups": [
+          {
+            "group": "Packages",
+            "pages": [
+              "api/kgo",
+              "api/kadm",
+              "api/kmsg",
+              "api/kfake",
+              "api/sr",
+              "api/sasl"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Feature-complete Kafka client supporting Kafka 0.8.0 through 4.1+",
+    "Full Exactly-Once Semantics (EOS) with idempotent and transactional producers",
+    "Consumer groups with cooperative and eager rebalancing strategies",
+    "All SASL mechanisms: GSSAPI/Kerberos, PLAIN, SCRAM, OAUTHBEARER",
+    "All compression types: gzip, snappy, lz4, zstd",
+    "High-level admin client (kadm) with comprehensive cluster management",
+    "Schema Registry client with Serde helpers for Avro/Protobuf encoding",
+    "In-memory fake Kafka cluster (kfake) for unit testing",
+    "Extensible hooks for custom metrics and logging integration",
+    "Plugin packages for Prometheus, OpenTelemetry, Zap, Zerolog, and more"
+  ],
+  "publicApiSurface": [
+    "kgo.NewClient(opts ...Opt) (*Client, error)",
+    "kgo.Client.Produce(ctx, record, promise)",
+    "kgo.Client.ProduceSync(ctx, records ...) ProduceResults",
+    "kgo.Client.PollFetches(ctx) Fetches",
+    "kgo.Client.PollRecords(ctx, maxPollRecords int) Fetches",
+    "kgo.Client.CommitUncommittedOffsets(ctx) error",
+    "kgo.NewGroupTransactSession(ctx, opts...) (*GroupTransactSession, error)",
+    "kgo.Client.Request(ctx, req kmsg.Request) (kmsg.Response, error)",
+    "kadm.NewClient(cl *kgo.Client) *Client",
+    "kadm.Client.CreateTopics(ctx, partitions, replicationFactor, configs, topics...) CreateTopicsResults",
+    "kadm.Client.DeleteTopics(ctx, topics...) DeleteTopicsResults",
+    "kadm.Client.DescribeGroups(ctx, groups...) DescribedGroups",
+    "kadm.Client.ListOffsets(ctx, epoch int32, topics ...string) ListedOffsets",
+    "sr.NewClient(opts ...Opt) (*Client, error)",
+    "sr.Client.Schema(ctx, id int) (Schema, error)",
+    "sr.Serde.Encode(v any) ([]byte, error)",
+    "sr.Serde.Decode(b []byte, v any) error",
+    "kfake.NewCluster(opts ...Opt) (*Cluster, error)",
+    "kfake.Cluster.ControlKey(key int16, fn func(kmsg.Request) (kmsg.Response, error, bool))"
+  ]
+}

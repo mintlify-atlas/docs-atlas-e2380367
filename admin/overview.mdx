@@ -1,0 +1,206 @@
+---
+title: 'Kafka administration with kadm and kmsg'
+description: 'Learn how to administer Kafka clusters using the high-level kadm package or low-level kmsg requests for full Kafka protocol control.'
+keywords: ['kafka', 'admin', 'kadm', 'kmsg', 'franz-go', 'administration']
+---
+
+The franz-go library gives you two ways to perform Kafka administration. The `kadm` package is a high-level admin client that abstracts common operations into ergonomic types and methods. The `kmsg` package exposes the complete Kafka wire protocol, letting you construct any request with full control over every field. Most applications should start with `kadm` and only reach for `kmsg` when they need capabilities that `kadm` does not expose.
+
+## The two approaches
+
+<CardGroup cols={2}>
+  <Card title="kadm" icon="layer-group">
+    A purpose-built admin client wrapping a `*kgo.Client`. Covers the most common admin operations — creating topics, managing groups, handling ACLs — with opinionated defaults and rich result types.
+  </Card>
+  <Card title="kmsg" icon="code">
+    Generated structs for every Kafka request and response. Use it when you need fields or request types that `kadm` does not surface, or when you want precise control over wire-level details.
+  </Card>
+</CardGroup>
+
+<Note>
+`kadm` and `kmsg` are complementary, not competing. You can use both in the same program: create a `kadm.Client` for day-to-day admin work and reach into `kgo.Client.Request` or `RequestSharded` for anything outside `kadm`'s scope.
+</Note>
+
+## Installing kadm
+
+The `kadm` package lives in its own Go module, separate from `kgo`:
+
+```bash
+go get github.com/twmb/franz-go/pkg/kadm
+```
+
+## Creating a kadm client
+
+`kadm.Client` is a thin wrapper around a `*kgo.Client`. You create the underlying `kgo.Client` first, then hand it to `kadm.NewClient`:
+
+```go
+package main
+
+import (
+    "context"
+    "fmt"
+    "strings"
+
+    "github.com/twmb/franz-go/pkg/kadm"
+    "github.com/twmb/franz-go/pkg/kgo"
+    "github.com/twmb/franz-go/pkg/kversion"
+)
+
+func main() {
+    cl, err := kgo.NewClient(
+        kgo.SeedBrokers("localhost:9092"),
+        // Pin the max request version to avoid accidentally using
+        // fields that require properties your brokers don't support.
+        kgo.MaxVersions(kversion.V2_4_0()),
+    )
+    if err != nil {
+        panic(err)
+    }
+    defer cl.Close()
+
+    adm := kadm.NewClient(cl)
+
+    topics, err := adm.ListTopics(context.Background())
+    if err != nil {
+        panic(err)
+    }
+    fmt.Printf("cluster has %d topics\n", len(topics))
+}
+```
+
+Alternatively, `kadm.NewOptClient` creates both the `kgo.Client` and the admin client in one call:
+
+```go
+adm, err := kadm.NewOptClient(
+    kgo.SeedBrokers("localhost:9092"),
+)
+if err != nil {
+    panic(err)
+}
+defer adm.Close()
+```
+
+## When to use kadm
+
+Use `kadm` when you want to:
+
+- Create, delete, or list topics
+- Describe or modify topic and broker configurations
+- List, describe, or delete consumer groups
+- Fetch, commit, or delete consumer group offsets
+- Calculate consumer lag
+- Manage ACLs
+
+The `kadm` package makes opinionated choices — for example, it uses a default 15-second timeout on requests that accept one, and it merges per-broker shard errors into a single `ShardErrors` value. If those choices do not fit your use case, `kmsg` gives you full control.
+
+## When to use kmsg
+
+Use `kmsg` when you need:
+
+- A request type that `kadm` does not yet support
+- Fine-grained control over every request field
+- Access to response fields that `kadm` abstracts away
+
+## Issuing raw kmsg requests
+
+To send a raw request, use `kgo.Client.Request` (for requests routed to a single broker) or `kgo.Client.RequestSharded` (for requests that can be split across brokers, like `ListOffsets` or `ListGroups`).
+
+Always construct kmsg structs with their `New` or `NewPtr` constructor. These call `Default()` on fields that have non-zero defaults, keeping your code forward-compatible as Kafka adds new fields:
+
+```go
+package main
+
+import (
+    "context"
+    "fmt"
+
+    "github.com/twmb/franz-go/pkg/kgo"
+    "github.com/twmb/franz-go/pkg/kmsg"
+)
+
+func fetchMetadata(ctx context.Context, cl *kgo.Client, topicNames ...string) error {
+    req := kmsg.NewMetadataRequest()
+    for _, topic := range topicNames {
+        t := kmsg.NewMetadataRequestTopic()
+        t.Topic = kmsg.StringPtr(topic)
+        req.Topics = append(req.Topics, t)
+    }
+
+    resp, err := req.RequestWith(ctx, cl)
+    if err != nil {
+        return err
+    }
+
+    for _, topic := range resp.Topics {
+        fmt.Printf("topic %s: %d partitions\n", *topic.Topic, len(topic.Partitions))
+    }
+    fmt.Printf("cluster has %d brokers\n", len(resp.Brokers))
+    return nil
+}
+```
+
+<Tip>
+Consider setting `kgo.MinVersions` when you need certain fields in a request to be present. If the broker does not support the version you require, the client returns an error instead of silently dropping those fields.
+</Tip>
+
+## Error handling in kadm
+
+`kadm` uses several error patterns depending on the operation.
+
+### ShardErrors
+
+Some operations fan out to multiple brokers internally (for example, `DeleteRecords` or `ListGroups`). If some shards succeed and others fail, `kadm` returns the partial result alongside a `*ShardErrors` value. You can log or react to the shard errors while still using the partial result:
+
+```go
+groups, err := adm.ListGroups(ctx)
+var se *kadm.ShardErrors
+if errors.As(err, &se) {
+    for _, e := range se.Errs {
+        log.Printf("broker %d: %v", e.Broker.NodeID, e.Err)
+    }
+}
+// groups may still be usable even when err != nil
+for _, g := range groups {
+    fmt.Println(g.Group)
+}
+```
+
+### AuthError
+
+Methods that fail completely on authorization problems return an `*AuthError`. Unlike shard errors, an auth error means the entire result is invalid:
+
+```go
+topics, err := adm.ListTopics(ctx)
+var ae *kadm.AuthError
+if errors.As(err, &ae) {
+    log.Fatalf("not authorized: %v", ae)
+}
+```
+
+### Per-item errors in result maps
+
+Many methods return a map or slice where each entry carries its own `Err` field. Always check these in addition to the top-level error:
+
+```go
+responses, err := adm.CreateTopics(ctx, 6, 3, nil, "orders", "payments")
+if err != nil {
+    log.Fatal(err)
+}
+for _, r := range responses {
+    if r.Err != nil {
+        log.Printf("topic %s: %v", r.Topic, r.Err)
+    }
+}
+```
+
+### Helper functions for single-item calls
+
+When you pass a single item to a variadic method and want a single result back, use `kadm.AnyE` or `kadm.FirstE`:
+
+```go
+resp, err := kadm.AnyE(adm.CreateTopics(ctx, 6, 3, nil, "my-topic"))
+if err != nil {
+    log.Fatal(err)
+}
+fmt.Println(resp.Topic, resp.NumPartitions)
+```

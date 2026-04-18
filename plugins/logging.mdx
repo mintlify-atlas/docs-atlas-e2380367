@@ -1,0 +1,322 @@
+---
+title: 'Structured logging plugins for franz-go'
+description: 'Connect any structured logger to franz-go: kzap, kzerolog, klogrus, kslog, kphuslog, and klogr are drop-in adapters for the kgo.Logger interface.'
+keywords: ['franz-go logging', 'kzap', 'kzerolog', 'klogrus', 'kslog', 'kafka logger go']
+---
+
+franz-go emits structured log messages through a `kgo.Logger` interface that you provide when constructing the client. Rather than bundling a logger directly, the library ships a collection of thin adapter plugins — one per popular logging library — so you can use the logger your application already depends on without pulling in an additional dependency. Each adapter translates kgo's four log levels (debug, info, warn, error) into the equivalent levels of the target library.
+
+## The Logger interface
+
+The interface every logging plugin implements is:
+
+```go
+type Logger interface {
+    // Level returns the log level to log at. The client checks this
+    // before constructing a log message, so returning LogLevelNone
+    // disables all logging.
+    Level() LogLevel
+
+    // Log logs a message at the given level. keyvals is a flat list
+    // of alternating string keys and arbitrary values.
+    Log(level LogLevel, msg string, keyvals ...any)
+}
+```
+
+The four log levels are `kgo.LogLevelDebug`, `kgo.LogLevelInfo`, `kgo.LogLevelWarn`, `kgo.LogLevelError`, and `kgo.LogLevelNone`. For most production workloads `LogLevelInfo` is the right starting point.
+
+## BasicLogger
+
+If you need a quick logger with no extra dependencies during development, the built-in `kgo.BasicLogger` writes to any `io.Writer` and requires no additional package:
+
+```go
+cl, err := kgo.NewClient(
+    kgo.SeedBrokers("localhost:9092"),
+    kgo.WithLogger(kgo.BasicLogger(os.Stderr, kgo.LogLevelInfo, nil)),
+)
+```
+
+## Logging plugins
+
+Install only the plugin that matches your existing logger.
+
+<Tabs>
+  <Tab title="kslog (slog)">
+    `kslog` wraps Go's standard library `log/slog` logger (requires Go 1.21+). It is the recommended choice for new projects because it has no external dependencies.
+
+    **Install:**
+    ```bash
+    go get github.com/twmb/franz-go/plugin/kslog
+    ```
+
+    **Usage:**
+    ```go
+    import (
+        "log/slog"
+        "os"
+
+        "github.com/twmb/franz-go/pkg/kgo"
+        "github.com/twmb/franz-go/plugin/kslog"
+    )
+
+    sl := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
+        Level: slog.LevelInfo,
+    }))
+
+    cl, err := kgo.NewClient(
+        kgo.SeedBrokers("localhost:9092"),
+        kgo.WithLogger(kslog.New(sl)),
+    )
+    ```
+
+    The `kslog.Logger` checks the handler's enabled levels by calling `sl.Enabled` for each kgo level, so the log level reported to kgo always reflects your `slog.HandlerOptions.Level` setting. You can also use `slog.Default()` if you have configured the global logger elsewhere.
+  </Tab>
+  <Tab title="kzap (Uber Zap)">
+    `kzap` wraps `go.uber.org/zap`. By default it auto-detects the highest enabled level on the underlying zap core; you can override this with a static or atomic level.
+
+    **Install:**
+    ```bash
+    go get github.com/twmb/franz-go/plugin/kzap
+    ```
+
+    **Usage:**
+    ```go
+    import (
+        "go.uber.org/zap"
+
+        "github.com/twmb/franz-go/pkg/kgo"
+        "github.com/twmb/franz-go/plugin/kzap"
+    )
+
+    zl, err := zap.NewProduction()
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    cl, err := kgo.NewClient(
+        kgo.SeedBrokers("localhost:9092"),
+        kgo.WithLogger(kzap.New(zl)),
+    )
+    ```
+
+    **With an AtomicLevel** (allows runtime log level changes):
+    ```go
+    atomicLevel := zap.NewAtomicLevelAt(zap.InfoLevel)
+    zl, _ := zap.NewProduction(zap.WithOptions(zap.WrapCore(func(c zapcore.Core) zapcore.Core {
+        return zapcore.NewCore(
+            zapcore.NewJSONEncoder(zap.NewProductionEncoderConfig()),
+            zapcore.AddSync(os.Stderr),
+            atomicLevel,
+        )
+    })))
+
+    cl, err := kgo.NewClient(
+        kgo.SeedBrokers("localhost:9092"),
+        kgo.WithLogger(kzap.New(zl, kzap.AtomicLevel(atomicLevel))),
+    )
+    ```
+
+    **With a static level:**
+    ```go
+    kgo.WithLogger(kzap.New(zl, kzap.Level(kgo.LogLevelInfo)))
+    ```
+
+    **With a custom level function:**
+    ```go
+    kgo.WithLogger(kzap.New(zl, kzap.LevelFn(func() kgo.LogLevel {
+        return kgo.LogLevelInfo
+    })))
+    ```
+  </Tab>
+  <Tab title="kzerolog (zerolog)">
+    `kzerolog` wraps `github.com/rs/zerolog`. It maps zerolog's level to the equivalent kgo level and uses zerolog's `WithLevel` to log at the correct level.
+
+    **Install:**
+    ```bash
+    go get github.com/twmb/franz-go/plugin/kzerolog
+    ```
+
+    **Usage:**
+    ```go
+    import (
+        "os"
+
+        "github.com/rs/zerolog"
+
+        "github.com/twmb/franz-go/pkg/kgo"
+        "github.com/twmb/franz-go/plugin/kzerolog"
+    )
+
+    logger := zerolog.New(os.Stderr).Level(zerolog.InfoLevel).With().Timestamp().Logger()
+
+    cl, err := kgo.NewClient(
+        kgo.SeedBrokers("localhost:9092"),
+        kgo.WithLogger(kzerolog.New(&logger)),
+    )
+    ```
+
+    Note that `kzerolog.New` takes a pointer to a `zerolog.Logger`. The level is read from the logger's `GetLevel` method, so changes to the logger's level after construction are reflected automatically.
+  </Tab>
+  <Tab title="klogrus (logrus)">
+    `klogrus` wraps `github.com/sirupsen/logrus`. It accepts either a `*logrus.Logger` via `klogrus.New` or any custom type that implements `logrus.FieldLogger` plus a `GetLevel` method via `klogrus.NewFieldLogger`.
+
+    **Install:**
+    ```bash
+    go get github.com/twmb/franz-go/plugin/klogrus
+    ```
+
+    **Usage with `*logrus.Logger`:**
+    ```go
+    import (
+        "github.com/sirupsen/logrus"
+
+        "github.com/twmb/franz-go/pkg/kgo"
+        "github.com/twmb/franz-go/plugin/klogrus"
+    )
+
+    lr := logrus.New()
+    lr.SetLevel(logrus.InfoLevel)
+
+    cl, err := kgo.NewClient(
+        kgo.SeedBrokers("localhost:9092"),
+        kgo.WithLogger(klogrus.New(lr)),
+    )
+    ```
+
+    **Usage with a custom FieldLogger wrapper:**
+    ```go
+    // fl must implement logrus.FieldLogger and GetLevel() logrus.Level
+    cl, err := kgo.NewClient(
+        kgo.SeedBrokers("localhost:9092"),
+        kgo.WithLogger(klogrus.NewFieldLogger(fl)),
+    )
+    ```
+
+    Level mapping: logrus `panic`, `fatal`, and `error` map to `kgo.LogLevelError`; `warn` maps to `kgo.LogLevelWarn`; `info` maps to `kgo.LogLevelInfo`; `debug` and `trace` map to `kgo.LogLevelDebug`.
+  </Tab>
+  <Tab title="kphuslog (phuslog)">
+    `kphuslog` wraps `github.com/phuslu/log`.
+
+    **Install:**
+    ```bash
+    go get github.com/twmb/franz-go/plugin/kphuslog
+    ```
+
+    **Usage:**
+    ```go
+    import (
+        phuslog "github.com/phuslu/log"
+
+        "github.com/twmb/franz-go/pkg/kgo"
+        "github.com/twmb/franz-go/plugin/kphuslog"
+    )
+
+    pl := &phuslog.Logger{
+        Level:  phuslog.InfoLevel,
+        Writer: &phuslog.ConsoleWriter{},
+    }
+
+    cl, err := kgo.NewClient(
+        kgo.SeedBrokers("localhost:9092"),
+        kgo.WithLogger(kphuslog.New(pl)),
+    )
+    ```
+  </Tab>
+  <Tab title="klogr (logr)">
+    `klogr` wraps any `logr.Logger`. It maps kgo log levels to logr V levels: by default error maps to V(2), warn to V(4), info to V(6), and debug to V(8). You can override the mapping with `klogr.LevelToV`.
+
+    **Install:**
+    ```bash
+    go get github.com/twmb/franz-go/plugin/klogr
+    ```
+
+    **Usage:**
+    ```go
+    import (
+        "github.com/go-logr/logr"
+
+        "github.com/twmb/franz-go/pkg/kgo"
+        "github.com/twmb/franz-go/plugin/klogr"
+    )
+
+    // logrLogger is any logr.Logger from your chosen logr backend
+    cl, err := kgo.NewClient(
+        kgo.SeedBrokers("localhost:9092"),
+        kgo.WithLogger(klogr.New(logrLogger)),
+    )
+    ```
+
+    **With a custom level mapping:**
+    ```go
+    kgo.WithLogger(klogr.New(logrLogger, klogr.LevelToV(func(level kgo.LogLevel) int {
+        switch level {
+        case kgo.LogLevelError:
+            return 0
+        case kgo.LogLevelWarn:
+            return 1
+        case kgo.LogLevelInfo:
+            return 2
+        case kgo.LogLevelDebug:
+            return 3
+        }
+        return 0
+    })))
+    ```
+
+    For `kgo.LogLevelError`, `klogr` extracts the first `error` value from keyvals and passes it to `logr.Error`; all other levels use `logr.V(n).Info`.
+  </Tab>
+</Tabs>
+
+## Combining a logger with metrics
+
+Loggers and metrics hooks are completely independent. Use `kgo.WithLogger` for logging and `kgo.WithHooks` for metrics — both can be present at the same time:
+
+```go
+import (
+    "log/slog"
+    "net/http"
+    "os"
+
+    "github.com/twmb/franz-go/pkg/kgo"
+    "github.com/twmb/franz-go/plugin/kprom"
+    "github.com/twmb/franz-go/plugin/kslog"
+)
+
+sl := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+metrics := kprom.NewMetrics("myapp")
+
+cl, err := kgo.NewClient(
+    kgo.SeedBrokers("localhost:9092"),
+    kgo.WithLogger(kslog.New(sl)),
+    kgo.WithHooks(metrics),
+)
+
+go func() {
+    http.Handle("/metrics", metrics.Handler())
+    http.ListenAndServe(":9999", nil)
+}()
+```
+
+## Writing a custom logger
+
+If none of the provided adapters fits your situation, implement the `kgo.Logger` interface directly:
+
+```go
+type myLogger struct{}
+
+func (l *myLogger) Level() kgo.LogLevel { return kgo.LogLevelInfo }
+
+func (l *myLogger) Log(level kgo.LogLevel, msg string, keyvals ...any) {
+    // keyvals is a flat list: key, value, key, value, ...
+    fmt.Printf("[%v] %s %v\n", level, msg, keyvals)
+}
+
+cl, err := kgo.NewClient(
+    kgo.SeedBrokers("localhost:9092"),
+    kgo.WithLogger(&myLogger{}),
+)
+```
+
+<Tip>
+Start with `kgo.LogLevelInfo` in production. `LogLevelDebug` produces very verbose output — one log entry per broker read and write — which is helpful during development but expensive at scale.
+</Tip>

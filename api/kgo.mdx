@@ -1,0 +1,285 @@
+---
+title: "kgo package — core Kafka client API"
+description: "Complete API reference for the kgo package: the primary Go client for Kafka 0.8+, covering producing, consuming, transactions, hooks, and configuration."
+keywords: ["kafka", "go", "kgo", "producer", "consumer", "transactions", "franz-go"]
+---
+
+The `kgo` package is the primary entry point for franz-go. It provides a pure-Go Kafka client that supports producing, consuming, transactions, regex topic consuming, the latest partitioning strategies, data loss detection, closest-replica fetching, and every client-facing KIP. You install the module once and import this package to interact with any Kafka 0.8+ cluster.
+
+```bash
+go get github.com/twmb/franz-go
+```
+
+```go
+import "github.com/twmb/franz-go/pkg/kgo"
+```
+
+For the complete auto-generated reference, see [pkg.go.dev/github.com/twmb/franz-go/pkg/kgo](https://pkg.go.dev/github.com/twmb/franz-go/pkg/kgo).
+
+---
+
+## Client
+
+The `Client` type is the central object. Create one with `NewClient`, pass any number of `Opt` values to configure it, and reuse it across goroutines.
+
+```go
+cl, err := kgo.NewClient(
+    kgo.SeedBrokers("localhost:9092"),
+)
+if err != nil {
+    log.Fatal(err)
+}
+defer cl.Close()
+```
+
+| Function | Signature | Description |
+|---|---|---|
+| `NewClient` | `func NewClient(opts ...Opt) (*Client, error)` | Creates and returns a connected client. |
+| `Close` | `func (cl *Client) Close()` | Closes the client and flushes buffered records. |
+| `Ping` | `func (cl *Client) Ping(ctx context.Context) error` | Verifies the client can reach at least one broker. |
+| `OptValue` | `func (cl *Client) OptValue(opt any) any` | Returns the current value of a configuration option. |
+
+---
+
+## Producing
+
+Records are buffered and sent in batches. `Produce` is asynchronous; `ProduceSync` blocks until the record is acknowledged.
+
+```go
+r := &kgo.Record{
+    Topic: "my-topic",
+    Value: []byte("hello"),
+}
+
+// Async: promise is called when the record is produced or fails.
+cl.Produce(ctx, r, func(r *kgo.Record, err error) {
+    if err != nil {
+        log.Printf("produce error: %v", err)
+    }
+})
+
+// Sync: blocks until ack.
+if err := cl.ProduceSync(ctx, r).FirstErr(); err != nil {
+    log.Fatal(err)
+}
+```
+
+| Function | Signature | Description |
+|---|---|---|
+| `Produce` | `func (cl *Client) Produce(ctx context.Context, r *Record, promise func(*Record, error))` | Buffers a record for async production. |
+| `ProduceSync` | `func (cl *Client) ProduceSync(ctx context.Context, rs ...*Record) ProduceResults` | Produces records synchronously and returns results. |
+| `TryProduce` | `func (cl *Client) TryProduce(ctx context.Context, r *Record, promise func(*Record, error))` | Like `Produce` but returns `ErrMaxBuffered` instead of blocking. |
+| `Flush` | `func (cl *Client) Flush(ctx context.Context) error` | Flushes all buffered records. |
+| `AbortBufferedRecords` | `func (cl *Client) AbortBufferedRecords(ctx context.Context) error` | Fails all buffered records with `ErrAborting`. |
+
+<Note>
+Always check the error returned by `ProduceSync` using `.FirstErr()` or iterate over results with `.Each(fn)`. A `nil` error from `Flush` does not mean all records succeeded.
+</Note>
+
+---
+
+## Consuming
+
+Consumers read from topics or partitions either directly or as part of a consumer group.
+
+```go
+cl, _ := kgo.NewClient(
+    kgo.SeedBrokers("localhost:9092"),
+    kgo.ConsumerGroup("my-group"),
+    kgo.ConsumeTopics("my-topic"),
+)
+
+for {
+    fetches := cl.PollFetches(ctx)
+    if errs := fetches.Errors(); len(errs) > 0 {
+        log.Fatal(errs)
+    }
+    fetches.EachRecord(func(r *kgo.Record) {
+        fmt.Printf("topic=%s partition=%d offset=%d value=%s\n",
+            r.Topic, r.Partition, r.Offset, r.Value)
+    })
+}
+```
+
+| Function | Signature | Description |
+|---|---|---|
+| `PollFetches` | `func (cl *Client) PollFetches(ctx context.Context) Fetches` | Polls for a batch of fetches across all assigned partitions. |
+| `PollRecords` | `func (cl *Client) PollRecords(ctx context.Context, maxPollRecords int) Fetches` | Like `PollFetches` but limits the number of records returned. |
+| `AssignTopics` | `func (cl *Client) AssignTopics(topics ...string)` | Assigns topics for direct (non-group) consuming. |
+| `AssignPartitions` | `func (cl *Client) AssignPartitions(partitions map[string]map[int32]Offset)` | Assigns specific partitions for direct consuming. |
+| `AssignGroup` | `func (cl *Client) AssignGroup(group string, opts ...GroupOpt)` | Joins a consumer group. |
+| `AllowRebalance` | `func (cl *Client) AllowRebalance()` | Unblocks a rebalance paused by `BlockRebalanceOnPoll`. |
+| `CommitUncommittedOffsets` | `func (cl *Client) CommitUncommittedOffsets(ctx context.Context) error` | Commits all offsets that have been polled but not yet committed. |
+| `CommitOffsets` | `func (cl *Client) CommitOffsets(ctx context.Context, uncommitted map[string]map[int32]EpochOffset, onDone func(*kmsg.OffsetCommitRequest, *kmsg.OffsetCommitResponse, error))` | Commits specific offsets with an optional callback. |
+
+---
+
+## Transactions
+
+Use `GroupTransactSession` when you need exactly-once semantics for a consume-transform-produce loop. `NewGroupTransactSession` is a **package-level** function that accepts the same options as `NewClient`.
+
+```go
+sess, err := kgo.NewGroupTransactSession(
+    kgo.SeedBrokers("localhost:9092"),
+    kgo.TransactionalID("my-producer-v1"),
+    kgo.ConsumerGroup("my-eos-group"),
+    kgo.ConsumeTopics("input-topic"),
+)
+if err != nil {
+    log.Fatal(err)
+}
+defer sess.Close()
+
+for {
+    if err := sess.Begin(); err != nil {
+        log.Fatal(err)
+    }
+    fetches := sess.PollFetches(ctx)
+    // ... process records and produce transactionally ...
+    committed, err := sess.End(ctx, kgo.TryCommit)
+    if !committed {
+        log.Printf("transaction aborted: %v", err)
+    }
+}
+```
+
+| Function | Signature | Description |
+|---|---|---|
+| `NewGroupTransactSession` | `func NewGroupTransactSession(opts ...Opt) (*GroupTransactSession, error)` | Package-level function; creates a transactional client session. |
+| `Begin` | `func (s *GroupTransactSession) Begin() error` | Starts a new transaction. |
+| `End` | `func (s *GroupTransactSession) End(ctx context.Context, commit TransactionEndTry) (committed bool, err error)` | Commits or aborts the transaction; returns whether the commit succeeded. |
+| `PollFetches` | `func (s *GroupTransactSession) PollFetches(ctx context.Context) Fetches` | Polls within the transactional session. |
+| `Produce` | `func (s *GroupTransactSession) Produce(ctx context.Context, r *Record, promise func(*Record, error))` | Produces within the transaction. |
+
+<Warning>
+The client must be configured with a `TransactionalID` option before creating a `GroupTransactSession`. Calling `Begin` without a transaction ID returns an error.
+</Warning>
+
+---
+
+## Records and fetches
+
+### Record struct
+
+`Record` is used for both producing and consuming. When producing, set `Topic` and `Value` (and optionally `Key`, `Headers`, `Timestamp`). The client fills in `Partition`, `Offset`, `Attrs`, `ProducerID`, `ProducerEpoch`, and `LeaderEpoch` before delivering the promise.
+
+```go
+type Record struct {
+    Key           []byte
+    Value         []byte
+    Headers       []RecordHeader
+    Timestamp     time.Time
+    Topic         string
+    Partition     int32
+    Attrs         RecordAttrs
+    ProducerEpoch int16
+    ProducerID    int64
+    LeaderEpoch   int32
+    Offset        int64
+    Context       context.Context
+}
+```
+
+### Fetches type
+
+`Fetches` is the collection returned by `PollFetches`. It provides several iteration helpers.
+
+```go
+fetches.EachRecord(func(r *kgo.Record) { /* handle record */ })
+fetches.EachTopic(func(t kgo.FetchTopic) { /* per topic */ })
+fetches.EachPartition(func(p kgo.FetchTopicPartition) { /* per partition */ })
+fetches.Errors() // returns per-partition errors (not necessarily fatal)
+```
+
+| Type | Description |
+|---|---|
+| `Fetches` | Slice of `Fetch` values returned by a poll. |
+| `FetchTopicPartition` | A single partition's records and metadata within a fetch. |
+| `RecordIter` | Iterator over the records inside a `FetchTopicPartition`. |
+
+---
+
+## Configuration options
+
+Pass options to `NewClient`. You can introspect current values with `OptValue`.
+
+| Option | Description |
+|---|---|
+| `SeedBrokers(addrs ...string)` | Initial brokers to connect to. Defaults to `localhost:9092`. |
+| `ConsumerGroup(group string)` | Sets the consumer group ID. |
+| `ConsumeTopics(topics ...string)` | Topics to consume as part of a group or direct consumer. |
+| `ConsumePartitions(partitions map[string]map[int32]Offset)` | Specific partitions to consume directly. |
+| `ProducerBatchCompression(codecs ...CompressionCodec)` | Compression codecs to use, in order of preference (gzip, snappy, lz4, zstd). |
+| `RequiredAcks(acks Acks)` | Acks required before a produce is considered successful. |
+| `MaxBufferedRecords(n int)` | Maximum records to buffer before `Produce` blocks. |
+| `SASL(mechanisms ...sasl.Mechanism)` | One or more SASL mechanisms for authentication. |
+| `WithLogger(l Logger)` | Attaches a logger implementing the `Logger` interface. |
+| `WithHooks(hooks ...Hook)` | Registers observation hooks. |
+| `TransactionalID(id string)` | Enables exactly-once semantics for producing. |
+| `RecordDeliveryTimeout(t time.Duration)` | Maximum time a buffered record may wait before failing. |
+| `MaxBufferedBytes(n int64)` | Maximum total bytes buffered across all records. |
+| `FetchMaxBytes(n int32)` | Maximum bytes per fetch response. |
+| `SessionTimeout(t time.Duration)` | Consumer group session timeout. |
+| `RebalanceTimeout(t time.Duration)` | Consumer group rebalance timeout. |
+| `DisableIdempotentWrite()` | Disables idempotent producing (not recommended for production). |
+| `AllowAutoTopicCreation()` | Allows metadata requests to auto-create topics. |
+
+---
+
+## Hooks
+
+Hooks let you observe client internals for metrics, logging, or tracing without modifying client logic. Implement any subset of the hook interfaces and pass the value to `WithHooks`.
+
+```go
+type myHook struct{}
+
+func (myHook) OnBrokerConnect(meta kgo.BrokerMetadata, dur time.Duration, conn net.Conn, err error) {
+    log.Printf("connected to broker %d in %s, err=%v", meta.NodeID, dur, err)
+}
+
+cl, _ := kgo.NewClient(
+    kgo.SeedBrokers("localhost:9092"),
+    kgo.WithHooks(myHook{}),
+)
+```
+
+| Interface | Method | Called when |
+|---|---|---|
+| `HookNewClient` | `OnNewClient(*Client)` | Client is initialized. |
+| `HookClientClosed` | `OnClientClosed(*Client)` | Client is closed. |
+| `HookBrokerConnect` | `OnBrokerConnect(BrokerMetadata, time.Duration, net.Conn, error)` | A broker connection is opened. |
+| `HookBrokerDisconnect` | `OnBrokerDisconnect(BrokerMetadata, net.Conn)` | A broker connection is closed. |
+| `HookBrokerWrite` | `OnBrokerWrite(BrokerMetadata, int16, int, time.Duration, time.Duration, error)` | A request is written to a broker. |
+| `HookBrokerRead` | `OnBrokerRead(BrokerMetadata, int16, int, time.Duration, time.Duration, error)` | A response is read from a broker. |
+| `HookProduceBatchWritten` | `OnProduceBatchWritten(BrokerMetadata, string, int32, ProduceBatchMetrics)` | A produce batch is acknowledged. |
+| `HookFetchBatchRead` | `OnFetchBatchRead(BrokerMetadata, string, int32, FetchBatchMetrics)` | A fetch batch is read from a broker. |
+
+<Tip>
+Hooks must be safe for concurrent use and should be fast. If a hook needs significant processing time, copy the data you need and handle it asynchronously.
+</Tip>
+
+---
+
+## Partitioners
+
+The partitioner controls how records are assigned to partitions when producing. Pass a custom partitioner via the `Partitioner` option.
+
+| Partitioner | Description |
+|---|---|
+| `StickyKeyPartitioner(nil)` | Default. Hashes keys with murmur2; keyless records use sticky batching. |
+| `UniformBytesPartitioner(size, false, true, nil)` | Distributes records across partitions based on batch byte size. |
+| `RoundRobinPartitioner()` | Distributes records evenly across partitions in round-robin order. |
+| `ManualPartitioner()` | Uses the `Partition` field on the record — you set it before calling `Produce`. |
+
+To implement a custom partitioner, satisfy the `Partitioner` interface:
+
+```go
+type Partitioner interface {
+    ForTopic(string) TopicPartitioner
+}
+
+type TopicPartitioner interface {
+    RequiresConsistency(*Record) bool
+    Partition(r *Record, n int) int
+}
+```

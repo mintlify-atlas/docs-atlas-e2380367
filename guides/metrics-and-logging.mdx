@@ -1,0 +1,245 @@
+---
+title: 'Add metrics and logging to franz-go clients'
+description: 'Use the WithLogger option and hook interfaces in franz-go to capture logs, broker latency, produce and consume metrics, and per-record timing.'
+keywords: ['kafka', 'metrics', 'logging', 'hooks', 'prometheus', 'opentelemetry', 'franz-go', 'kprom', 'kotel']
+---
+
+Franz-go takes an unopinionated approach to observability: logging is controlled by a single `WithLogger` option, and metrics are collected through a hook system that lets you implement exactly the signals you care about. Both are disabled by default, so you incur zero overhead until you opt in. The library ships several drop-in plugin packages for common observability stacks so you can get started quickly.
+
+## Logging
+
+### The Logger interface
+
+The `kgo.Logger` interface has two methods:
+
+```go
+type Logger interface {
+    // Level returns the current log level.
+    // This must be safe to call concurrently.
+    Level() LogLevel
+
+    // Log emits a message with key/value pairs.
+    // This must be safe to call concurrently.
+    Log(level LogLevel, msg string, keyvals ...any)
+}
+```
+
+Log levels from lowest to highest verbosity: `LogLevelNone`, `LogLevelError`, `LogLevelWarn`, `LogLevelInfo`, `LogLevelDebug`. The client checks `Level()` before formatting a message, so expensive formatting is skipped when the level is below the threshold.
+
+### BasicLogger for development
+
+`kgo.BasicLogger` writes newline-delimited lines to any `io.Writer`:
+
+```go
+import (
+    "os"
+
+    "github.com/twmb/franz-go/pkg/kgo"
+)
+
+cl, err := kgo.NewClient(
+    kgo.SeedBrokers("localhost:9092"),
+    kgo.WithLogger(kgo.BasicLogger(os.Stderr, kgo.LogLevelInfo, nil)),
+)
+```
+
+The optional third argument is a `func() string` prefix function, useful for adding a request ID or hostname to every line.
+
+### Production loggers
+
+For production, use one of the drop-in plugin packages:
+
+<CardGroup cols={2}>
+  <Card title="kzap" icon="box" href="https://pkg.go.dev/github.com/twmb/franz-go/plugin/kzap">
+    Plug in `uber-go/zap` with `kgo.WithLogger(kzap.New(zapLogger))`.
+  </Card>
+  <Card title="kzerolog" icon="box" href="https://pkg.go.dev/github.com/twmb/franz-go/plugin/kzerolog">
+    Plug in `rs/zerolog` with `kgo.WithLogger(kzerolog.New(&logger))`.
+  </Card>
+  <Card title="kslog" icon="box" href="https://pkg.go.dev/github.com/twmb/franz-go/plugin/kslog">
+    Plug in the standard library `log/slog` with `kgo.WithLogger(kslog.New(slog.Default()))`.
+  </Card>
+  <Card title="klogrus" icon="box" href="https://pkg.go.dev/github.com/twmb/franz-go/plugin/klogrus">
+    Plug in `sirupsen/logrus` with `kgo.WithLogger(klogrus.New(logrusLogger))`.
+  </Card>
+</CardGroup>
+
+<Tip>
+  Use `LogLevelInfo` in production. If that is too noisy for your use case, open an issue — it likely means a log line should be changed to debug level.
+</Tip>
+
+## Hooks
+
+Hooks are the primary metrics mechanism in franz-go. A hook is any value whose type implements one or more hook interfaces. Register hooks with `kgo.WithHooks`:
+
+```go
+cl, err := kgo.NewClient(
+    kgo.SeedBrokers("localhost:9092"),
+    kgo.WithHooks(&myMetrics{}),
+)
+```
+
+A single struct can implement multiple hook interfaces. The client checks each hook at the relevant callsite using a type assertion, so you only pay for the interfaces you implement.
+
+### Available hook interfaces
+
+| Interface | Triggered when |
+|-----------|----------------|
+| `HookNewClient` | A `kgo.Client` is created |
+| `HookClientClosed` | A `kgo.Client` is closed |
+| `HookBrokerConnect` | A connection to a broker is established |
+| `HookBrokerDisconnect` | A broker connection is closed |
+| `HookBrokerWrite` | A request is written to a broker |
+| `HookBrokerRead` | A response is read from a broker |
+| `HookBrokerE2E` | A full request/response round-trip completes |
+| `HookBrokerThrottle` | A broker applies throttling |
+| `HookGroupManageError` | The consumer group loop encounters a fatal error |
+| `HookProduceBatchWritten` | A produce batch is acknowledged by the broker |
+| `HookFetchBatchRead` | A fetch batch is read from the broker |
+| `HookProduceRecordBuffered` | A record is buffered after `Produce` is called |
+| `HookProduceRecordPartitioned` | A record is assigned to a partition |
+| `HookProduceRecordUnbuffered` | A record's promise is about to be called |
+| `HookFetchRecordBuffered` | A fetched record is buffered and ready to poll |
+| `HookFetchRecordUnbuffered` | A buffered fetch record is unbuffered |
+
+### Implementing a custom hook
+
+The following example implements `HookBrokerConnect` and `HookBrokerE2E` to track connection counts and request latency:
+
+```go
+package main
+
+import (
+    "fmt"
+    "net"
+    "sync/atomic"
+    "time"
+
+    "github.com/twmb/franz-go/pkg/kgo"
+)
+
+type clientMetrics struct {
+    connects    atomic.Int64
+    disconnects atomic.Int64
+}
+
+// OnBrokerConnect implements kgo.HookBrokerConnect.
+func (m *clientMetrics) OnBrokerConnect(meta kgo.BrokerMetadata, initDur time.Duration, conn net.Conn, err error) {
+    if err != nil {
+        fmt.Printf("broker %d connect error: %v\n", meta.NodeID, err)
+        return
+    }
+    m.connects.Add(1)
+    fmt.Printf("broker %d connected in %s (total: %d)\n",
+        meta.NodeID, initDur, m.connects.Load())
+}
+
+// OnBrokerE2E implements kgo.HookBrokerE2E.
+func (m *clientMetrics) OnBrokerE2E(meta kgo.BrokerMetadata, key int16, e2e kgo.BrokerE2E) {
+    if e2e.Err() != nil {
+        return
+    }
+    fmt.Printf("broker %d key %d e2e latency: %s\n",
+        meta.NodeID, key, e2e.DurationE2E())
+}
+
+func main() {
+    metrics := &clientMetrics{}
+    cl, err := kgo.NewClient(
+        kgo.SeedBrokers("localhost:9092"),
+        kgo.WithHooks(metrics),
+    )
+    if err != nil {
+        panic(err)
+    }
+    defer cl.Close()
+}
+```
+
+### Tracking batch-level metrics
+
+`HookProduceBatchWritten` and `HookFetchBatchRead` expose compressed and uncompressed byte counts:
+
+```go
+type batchMetrics struct{}
+
+// OnProduceBatchWritten implements kgo.HookProduceBatchWritten.
+func (b *batchMetrics) OnProduceBatchWritten(meta kgo.BrokerMetadata, topic string, partition int32, m kgo.ProduceBatchMetrics) {
+    fmt.Printf("produced topic=%s partition=%d records=%d uncompressed=%d compressed=%d\n",
+        topic, partition, m.NumRecords, m.UncompressedBytes, m.CompressedBytes)
+}
+
+// OnFetchBatchRead implements kgo.HookFetchBatchRead.
+func (b *batchMetrics) OnFetchBatchRead(meta kgo.BrokerMetadata, topic string, partition int32, m kgo.FetchBatchMetrics) {
+    fmt.Printf("fetched topic=%s partition=%d records=%d\n",
+        topic, partition, m.NumRecords)
+}
+```
+
+## Latency tracking
+
+### Broker and request latency
+
+Use `HookBrokerE2E` for broker-level and per-request-type latency. The `BrokerE2E.DurationE2E()` method returns the total time from when the request was written until the response was fully read:
+
+```go
+func (m *myMetrics) OnBrokerE2E(meta kgo.BrokerMetadata, key int16, e2e kgo.BrokerE2E) {
+    // key == 0 is a Produce request; key == 1 is a Fetch request.
+    dur := e2e.DurationE2E()
+    // record dur in your histogram here
+    _ = dur
+}
+```
+
+### Per-record produce latency
+
+When a record is produced, its `Timestamp` field is set. Read it inside the promise callback to measure end-to-end latency for individual records:
+
+```go
+cl.Produce(ctx, &kgo.Record{
+    Topic: "events",
+    Value: []byte("hello"),
+}, func(r *kgo.Record, err error) {
+    if err == nil {
+        latency := time.Since(r.Timestamp)
+        fmt.Printf("record e2e latency: %s\n", latency)
+    }
+})
+```
+
+<Note>
+  Records are produced in batches internally. All records in a batch resolve together, so their individual `time.Since(r.Timestamp)` values will be nearly identical. Do not sum per-record latencies — treat each observation as discrete.
+</Note>
+
+### Per-record consume latency
+
+For producer-to-consumer end-to-end latency, compare the record's `Timestamp` (set by the producer) with the current time when the consumer processes the record:
+
+```go
+fetches := cl.PollFetches(ctx)
+fetches.EachRecord(func(r *kgo.Record) {
+    e2e := time.Since(r.Timestamp)
+    fmt.Printf("topic=%s partition=%d offset=%d producer-to-consumer latency: %s\n",
+        r.Topic, r.Partition, r.Offset, e2e)
+})
+```
+
+## Drop-in metrics plugins
+
+If you want a ready-made metrics implementation, franz-go provides several plugins:
+
+<CardGroup cols={3}>
+  <Card title="kprom" icon="chart-bar" href="https://pkg.go.dev/github.com/twmb/franz-go/plugin/kprom">
+    Prometheus metrics with connection, read/write byte, and batch counters.
+  </Card>
+  <Card title="kgmetrics" icon="chart-line" href="https://pkg.go.dev/github.com/twmb/franz-go/plugin/kgmetrics">
+    Metrics via the `beorn7/perks` gmetrics library.
+  </Card>
+  <Card title="kotel" icon="activity" href="https://pkg.go.dev/github.com/twmb/franz-go/plugin/kotel">
+    OpenTelemetry traces and metrics. Hooks for produce and consume record spans.
+  </Card>
+</CardGroup>
+
+<Tip>
+  Latencies are intentionally omitted from the plugin packages to avoid cardinality explosion. If you need latency histograms, implement a custom hook that uses your preferred bucketing strategy.
+</Tip>

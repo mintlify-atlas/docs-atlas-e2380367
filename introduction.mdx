@@ -1,0 +1,95 @@
+---
+title: "franz-go: a complete Kafka client for Go"
+description: "franz-go is a pure-Go Apache Kafka client with full KIP coverage, EOS support, and best-in-class throughput for Kafka v0.8.0 through v4.1+."
+keywords: ["kafka", "go", "client", "franz-go", "kgo", "producer", "consumer"]
+---
+
+franz-go is a full-featured Apache Kafka client written entirely in Go—no CGo, no C bindings, no wrapper around a C library. It targets every Kafka feature from v0.8.0 through v4.1+, exposes an idiomatic Go API built around contexts and variadic options, and consistently outperforms every other Go Kafka client in both produce and consume throughput.
+
+<Note>
+  franz-go is compatible with any Kafka-protocol-compliant broker: Apache Kafka,
+  Redpanda, Confluent Platform, Amazon MSK, and Microsoft Event Hubs.
+</Note>
+
+## Why franz-go
+
+Most Go Kafka clients either wrap a C library (confluent-kafka-go wraps librdkafka) or implement only a subset of the Kafka protocol. franz-go takes a different approach: it implements the full wire protocol in pure Go, code-generates protocol types from the official Kafka schema, and supports every non-Java-specific KIP that has ever shipped.
+
+The result is a client that:
+
+- Runs anywhere Go runs—no system dependencies, no CGo.
+- Gives you the complete Kafka surface area from a single package (`github.com/twmb/franz-go/pkg/kgo`).
+- Lets one `Client` value both produce and consume simultaneously, with or without a consumer group.
+- Handles all error retry, metadata refresh, and broker reconnection transparently.
+
+## Key features
+
+- **Full Exactly-Once Semantics (EOS)** — idempotent and transactional producers, KIP-447 producer scalability.
+- **All consumer group balancers** — eager (round-robin, range, sticky) and cooperative (cooperative-sticky), plus the next-generation KIP-848 protocol (opt-in).
+- **All compression codecs** — gzip, snappy, lz4, zstd.
+- **All SASL mechanisms** — GSSAPI/Kerberos, PLAIN, SCRAM-SHA-256, SCRAM-SHA-512, OAUTHBEARER (including OIDC and JWT bearer).
+- **TLS** — via a custom dialer; bring your own `*tls.Config`.
+- **Data loss detection** — detects log truncation via OffsetForLeaderEpoch (KIP-320).
+- **Closest-replica fetching** — rack-aware fetching to reduce cross-AZ traffic (KIP-392).
+- **Hook-based metrics and logging** — plug in Prometheus, OpenTelemetry, zap, zerolog, slog, and more through the `plugin/` packages.
+- **High-level admin client** — `pkg/kadm` wraps common admin operations in a friendly API.
+- **Schema registry client** — `pkg/sr` provides Avro/Protobuf/JSON schema registration and a `Serde` helper.
+- **In-process fake broker** — `pkg/kfake` lets you write deterministic unit tests without a real Kafka cluster.
+
+## Benchmark results
+
+For 100-byte messages, franz-go is the fastest Go Kafka client:
+
+| Comparison | Produce | Consume |
+|---|---|---|
+| vs. confluent-kafka-go | **4x faster** | **10–20x faster** |
+| vs. sarama | **2.5x faster** | **1.5x faster** |
+| vs. segment kafka-go | **2.4x faster** | **2–6x faster** |
+
+<Tip>
+  You can reproduce these numbers yourself using the `examples/bench` tool,
+  which also includes comparison code for the other clients.
+</Tip>
+
+## Compatible brokers
+
+franz-go speaks the Kafka wire protocol and works with any compliant broker:
+
+- **Apache Kafka** — the reference implementation, v0.8.0 through v4.1+.
+- **Redpanda** — the fastest Kafka-compatible streaming platform.
+- **Confluent Platform** — including Schema Registry integration via `pkg/sr`.
+- **Amazon MSK** — including IAM authentication via the SASL OAUTHBEARER plugin.
+- **Microsoft Event Hubs** — note that Event Hubs does not support producer-side compression; use `kgo.ProducerBatchCompression(kgo.NoCompression)`.
+
+## KIP coverage
+
+franz-go supports every non-Java-specific, client-facing Kafka Improvement Proposal (KIP). Protocol types are code-generated from the official Kafka schema, so new wire-level KIPs are supported as soon as the generated code is updated. The README contains a full table of every supported KIP from KIP-1 through KIP-1166.
+
+<Info>
+  The next-generation consumer group protocol (KIP-848) is fully implemented
+  but deliberately hidden by default due to broker-side concerns. See the
+  v1.19.0 release notes for the opt-in context key.
+</Info>
+
+## Versioning and API stability
+
+The main module is `github.com/twmb/franz-go`. Plugins and sub-packages are released as separate modules with independent version tags, so you can upgrade `pkg/kadm` or `plugin/kprom` without changing the core client version.
+
+By default, the client negotiates the highest API version each broker supports. Use the `MaxVersions` option to pin to a specific Kafka protocol version if you need strict compatibility with older brokers.
+
+## Get started
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Install franz-go and run your first producer and consumer in minutes.
+  </Card>
+  <Card title="Installation" icon="package" href="/installation">
+    Understand the multi-module layout and install only what you need.
+  </Card>
+  <Card title="Producing" icon="upload" href="/concepts/producing">
+    Learn about async and sync production, batching, compression, and EOS.
+  </Card>
+  <Card title="Consuming" icon="download" href="/concepts/consuming">
+    Learn about direct consumers, consumer groups, and offset management.
+  </Card>
+</CardGroup>

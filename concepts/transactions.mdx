@@ -1,0 +1,161 @@
+---
+title: "Exactly-once semantics and Kafka transactions"
+description: "Learn how franz-go implements Kafka transactions, EOS consume-transform-produce pipelines, and the safety guarantees it provides for pre-2.5 clusters."
+keywords: ["kafka", "transactions", "exactly-once", "EOS", "GroupTransactSession", "KIP-447", "franz-go", "kgo"]
+---
+
+Kafka transactions allow you to produce records and commit consumer offsets atomically — either all changes are visible or none are. franz-go exposes this capability at two levels: a low-level transactional producer API for standalone batch production, and a higher-level `GroupTransactSession` type that manages the entire consume-transform-produce loop safely, including handling rebalances and broker failures without duplicates.
+
+## Transactional producer
+
+To produce transactionally without a consumer group, configure a `TransactionalID` and call `BeginTransaction` / `EndTransaction` around each batch:
+
+```go
+cl, err := kgo.NewClient(
+    kgo.SeedBrokers("localhost:9092"),
+    kgo.DefaultProduceTopic("output-topic"),
+    kgo.TransactionalID("my-producer-v1"),
+)
+if err != nil {
+    log.Fatal(err)
+}
+defer cl.Close()
+
+ctx := context.Background()
+
+for doCommit := true; ; doCommit = !doCommit {
+    if err := cl.BeginTransaction(); err != nil {
+        log.Fatalf("begin transaction: %v", err)
+    }
+
+    e := kgo.AbortingFirstErrPromise(cl)
+    for i := range 10 {
+        cl.Produce(ctx, kgo.StringRecord(fmt.Sprintf("record-%d", i)), e.Promise())
+    }
+    perr := e.Err()
+    commit := kgo.TransactionEndTry(doCommit && perr == nil)
+
+    switch err := cl.EndTransaction(ctx, commit); err {
+    case nil:
+        // committed or aborted cleanly
+    case kerr.OperationNotAttempted:
+        // the transaction was already invalid; force an abort
+        if err := cl.EndTransaction(ctx, kgo.TryAbort); err != nil {
+            log.Fatalf("abort failed: %v", err)
+        }
+    default:
+        log.Fatalf("end transaction: %v", err)
+    }
+}
+```
+
+`TransactionEndTry` is a named `bool` — `TryCommit` (`true`) and `TryAbort` (`false`) — that you pass to `EndTransaction`. If the internal state makes a commit impossible (for example, a produce failed), `EndTransaction` downgrades the attempt to an abort automatically.
+
+<Note>
+The transactional ID must be unique per producer instance and stable across restarts. Reusing the same ID allows Kafka to fence zombie producers from a previous epoch.
+</Note>
+
+## Consuming only committed records
+
+Consumers that read from topics written by transactional producers should set `FetchIsolationLevel` to `ReadCommitted`. This ensures they only see records that belong to committed transactions and never observe aborted or in-flight data:
+
+```go
+cl, err := kgo.NewClient(
+    kgo.SeedBrokers("localhost:9092"),
+    kgo.ConsumeTopics("output-topic"),
+    kgo.FetchIsolationLevel(kgo.ReadCommitted()),
+)
+```
+
+Without this option the client defaults to `ReadUncommitted`, which includes records from aborted transactions.
+
+## EOS with GroupTransactSession
+
+For an exactly-once consume-transform-produce pipeline, use `NewGroupTransactSession`. This type wraps a `*kgo.Client` and overrides the partition-revoked and partition-lost callbacks to automatically abort any in-flight transaction whenever a rebalance could lead to duplicate processing:
+
+```go
+sess, err := kgo.NewGroupTransactSession(
+    kgo.SeedBrokers("localhost:9092"),
+    kgo.TransactionalID("eos-consumer-v1"),
+    kgo.ConsumerGroup("my-eos-group"),
+    kgo.ConsumeTopics("input-topic"),
+    kgo.DefaultProduceTopic("output-topic"),
+    kgo.FetchIsolationLevel(kgo.ReadCommitted()),
+)
+if err != nil {
+    log.Fatal(err)
+}
+defer sess.Close()
+
+ctx := context.Background()
+
+for {
+    fetches := sess.PollFetches(ctx)
+
+    if errs := fetches.Errors(); len(errs) > 0 {
+        for _, e := range errs {
+            log.Printf("fetch error topic=%s partition=%d: %v",
+                e.Topic, e.Partition, e.Err)
+        }
+    }
+
+    if err := sess.Begin(); err != nil {
+        log.Fatalf("begin: %v", err)
+    }
+
+    e := kgo.AbortingFirstErrPromise(sess.Client())
+    fetches.EachRecord(func(r *kgo.Record) {
+        out := transform(r)
+        sess.Produce(ctx, kgo.StringRecord(out), e.Promise())
+    })
+
+    committed, err := sess.End(ctx, e.Err() == nil)
+    if !committed {
+        log.Fatalf("end transaction: %v", err)
+    }
+}
+```
+
+### How Begin and End work
+
+- `Begin` calls `BeginTransaction` on the underlying client. Call it after each poll, before producing.
+- `End(ctx, commit)` flushes (or aborts) buffered records, checks whether a rebalance has happened since `Begin`, and then calls `EndTransaction`. If a rebalance was detected it forces an abort regardless of the `commit` argument. This is the "if in doubt, abort" policy.
+- `End` returns `(committed bool, err error)`. A non-committed result always means an error occurred — the session retries internally, so a false return means something unrecoverable happened.
+
+<Warning>
+Do not manage transactions on the underlying `sess.Client()` directly. Use the `GroupTransactSession` methods (`Begin`, `End`, `Produce`, `PollFetches`) so that the session's safety logic remains intact.
+</Warning>
+
+## KIP-447 and pre-2.5 cluster safety
+
+KIP-447 (Kafka 2.5+) introduced `RequireStable` on `OffsetFetch`, which causes the broker to block offset responses until all pending transactional commits for those offsets are resolved. This eliminates a class of duplicate-processing bugs that could occur when a rebalance finished faster than transactional markers propagated.
+
+franz-go **always** sets `RequireStable=true` on group consumer `OffsetFetch` requests, matching Java client behavior. For clusters that support KIP-848 (the next-generation group protocol), which requires KIP-447 support, this is always safe.
+
+For older brokers (pre-2.5) that do not support `RequireStable`, franz-go falls back to a timing-based heuristic: after a successful commit it sleeps 500 ms before releasing the lock that allows a rebalance to proceed. The assumption is that 500 ms is enough time for Kafka to propagate transactional markers to all affected partitions before a new consumer can re-join, sync, and fetch offsets.
+
+<Info>
+The `RequireStableFetchOffsets` option is now a no-op — stable fetch offsets are always enabled. You do not need to set it explicitly.
+</Info>
+
+## Transaction timeout and session timeout relationship
+
+franz-go defaults the transactional timeout to be **strictly less than** the group session timeout. This ordering is intentional: if a produce or `EndTxn` request gets stuck in limbo, the transaction times out on the broker _before_ the consumer member is booted from the group. The sequence of events guaranteed by this invariant is:
+
+<Steps>
+  <Step title="Begin a transaction and verify group membership">
+    `Begin` starts the transaction. A successful heartbeat immediately before `End` confirms the client is still in the group.
+  </Step>
+  <Step title="Produce and call End">
+    Records are flushed to the broker. If any request hangs past the transactional timeout, the broker expires the transaction before the member is kicked.
+  </Step>
+  <Step title="EndTxn completes or the transaction expires">
+    Either `EndTxn` succeeds within the session timeout, or the transactional timeout fires first and Kafka rolls back the transaction — preventing a commit from landing after the consumer is evicted.
+  </Step>
+</Steps>
+
+## The "if in doubt, abort" philosophy
+
+`GroupTransactSession` deliberately favors extra aborts over any risk of duplicates. A rebalance during a transaction — even one where no partitions were actually revoked — causes the next `End` call to abort. This may mean re-processing a batch of records, but it ensures you never commit offsets for records that another consumer has already taken ownership of.
+
+Aborts are cheap. Duplicates are not. On workloads with infrequent rebalances the extra aborts are negligible, and on workloads with frequent rebalances the caution is justified.

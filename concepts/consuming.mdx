@@ -1,0 +1,252 @@
+---
+title: "Consuming Kafka messages and consumer groups"
+description: "Learn how to consume Kafka records in franz-go using direct partition assignment, consumer groups, cooperative rebalancing, and offset management patterns."
+keywords: ["kafka", "consumer", "consumer group", "poll", "offset", "rebalance", "franz-go", "kgo"]
+---
+
+franz-go supports three modes of consuming: direct partition assignment for full manual control, simple topic-level consuming for stateless workloads, and consumer groups for distributed, fault-tolerant processing. All three modes expose the same polling API so you can switch between them by changing a few options rather than restructuring your consuming loop.
+
+## Direct partition consuming
+
+Use `ConsumePartitions` when you want to assign specific partitions without joining a consumer group:
+
+```go
+cl, err := kgo.NewClient(
+    kgo.SeedBrokers("localhost:9092"),
+    kgo.ConsumePartitions(map[string]map[int32]kgo.Offset{
+        "events": {
+            0: kgo.NewOffset().AtStart(),
+            1: kgo.NewOffset().AtStart(),
+        },
+    }),
+)
+```
+
+For simpler cases where you want to consume all partitions of one or more topics, use `ConsumeTopics`:
+
+```go
+cl, err := kgo.NewClient(
+    kgo.SeedBrokers("localhost:9092"),
+    kgo.ConsumeTopics("events", "alerts"),
+)
+```
+
+You can also consume topics matching a regular expression:
+
+```go
+cl, err := kgo.NewClient(
+    kgo.SeedBrokers("localhost:9092"),
+    kgo.ConsumeTopics("^metrics-.*"),
+)
+```
+
+## Consumer groups
+
+Add `ConsumerGroup` to any of the above to turn direct consuming into group consuming. The client coordinates with the broker to assign partitions across all members of the group, and rebalances automatically as members join and leave:
+
+```go
+cl, err := kgo.NewClient(
+    kgo.SeedBrokers("localhost:9092"),
+    kgo.ConsumerGroup("my-service"),
+    kgo.ConsumeTopics("events"),
+)
+if err != nil {
+    log.Fatal(err)
+}
+defer cl.Close()
+```
+
+### The cooperative-sticky balancer
+
+franz-go defaults to the **cooperative-sticky** balancer (KIP-429). Unlike eager balancers, cooperative rebalancing only revokes the partitions that need to move — all other partitions continue to be consumed during the rebalance, eliminating the "stop the world" pause that classic balancers impose.
+
+<Warning>
+Cooperative-sticky is **not** compatible with the historical balancers (range, roundrobin, sticky). If you are running franz-go alongside clients that use an older balancer strategy, you must explicitly configure a shared balancer:
+
+```go
+kgo.Balancers(kgo.RoundRobinBalancer())
+```
+</Warning>
+
+## Polling for records
+
+### PollFetches
+
+`PollFetches` blocks until records are available or the context is canceled. It returns a `Fetches` value that may contain records from multiple brokers and partitions:
+
+```go
+ctx := context.Background()
+for {
+    fetches := cl.PollFetches(ctx)
+    if fetches.IsClientClosed() {
+        break
+    }
+    if errs := fetches.Errors(); len(errs) > 0 {
+        for _, e := range errs {
+            log.Printf("fetch error topic=%s partition=%d: %v",
+                e.Topic, e.Partition, e.Err)
+        }
+    }
+    fetches.EachRecord(func(r *kgo.Record) {
+        process(r)
+    })
+}
+```
+
+### PollRecords
+
+`PollRecords` is like `PollFetches` but caps the number of records returned in a single call. This is useful when you use `BlockRebalanceOnPoll` and need to ensure processing stays within your rebalance timeout:
+
+```go
+fetches := cl.PollRecords(ctx, 100) // at most 100 records
+```
+
+## Iterating over fetches
+
+`Fetches` exposes several iteration patterns. Choose the one that matches your processing style:
+
+<Tabs>
+  <Tab title="EachRecord">
+    The simplest option — visits every record across all topics and partitions:
+
+    ```go
+    fetches.EachRecord(func(r *kgo.Record) {
+        fmt.Printf("topic=%s partition=%d offset=%d value=%s\n",
+            r.Topic, r.Partition, r.Offset, r.Value)
+    })
+    ```
+  </Tab>
+  <Tab title="RecordIter">
+    An explicit iterator, useful when you need to break early:
+
+    ```go
+    iter := fetches.RecordIter()
+    for !iter.Done() {
+        r := iter.Next()
+        if shouldStop(r) {
+            break
+        }
+        process(r)
+    }
+    ```
+  </Tab>
+  <Tab title="EachPartition">
+    Visits records grouped by partition, which is useful when you need partition-level context such as the high watermark:
+
+    ```go
+    fetches.EachPartition(func(p kgo.FetchTopicPartition) {
+        log.Printf("partition %d high watermark %d", p.Partition, p.HighWatermark)
+        for _, r := range p.Records {
+            process(r)
+        }
+    })
+    ```
+  </Tab>
+</Tabs>
+
+## Offset management
+
+### Autocommit (default)
+
+By default, the group consumer commits offsets automatically every **5 seconds**, commits again when partitions are revoked during a rebalance, and performs a blocking commit when the client closes. For most workloads this is all you need.
+
+If you want to observe or react to autocommit errors, supply a callback:
+
+```go
+kgo.AutoCommitCallback(func(cl *kgo.Client, req *kmsg.OffsetCommitRequest, resp *kmsg.OffsetCommitResponse, err error) {
+    if err != nil {
+        log.Printf("autocommit error: %v", err)
+    }
+})
+```
+
+### Manual commit
+
+To commit on your own schedule, disable autocommit and call `CommitUncommittedOffsets` after processing each batch:
+
+```go
+cl, err := kgo.NewClient(
+    kgo.SeedBrokers("localhost:9092"),
+    kgo.ConsumerGroup("my-service"),
+    kgo.ConsumeTopics("events"),
+    kgo.DisableAutoCommit(),
+)
+
+// In your consume loop:
+fetches := cl.PollFetches(ctx)
+fetches.EachRecord(func(r *kgo.Record) {
+    process(r)
+})
+if err := cl.CommitUncommittedOffsets(ctx); err != nil {
+    log.Printf("commit error: %v", err)
+}
+```
+
+### OnPartitionsRevoked and OnPartitionsAssigned
+
+These callbacks fire during rebalances and let you commit offsets, release resources, or set up state for new partitions:
+
+```go
+cl, err := kgo.NewClient(
+    kgo.SeedBrokers("localhost:9092"),
+    kgo.ConsumerGroup("my-service"),
+    kgo.ConsumeTopics("events"),
+    kgo.OnPartitionsAssigned(func(ctx context.Context, cl *kgo.Client, assigned map[string][]int32) {
+        log.Printf("assigned partitions: %v", assigned)
+    }),
+    kgo.OnPartitionsRevoked(func(ctx context.Context, cl *kgo.Client, revoked map[string][]int32) {
+        // Commit before returning; the rebalance blocks until this function returns.
+        if err := cl.CommitUncommittedOffsets(ctx); err != nil {
+            log.Printf("commit on revoke failed: %v", err)
+        }
+    }),
+)
+```
+
+<Warning>
+The rebalance does not complete until `OnPartitionsRevoked` returns. If you are manually committing, you **must** commit inside this callback; otherwise, the new partition owner may re-process records you have already consumed.
+</Warning>
+
+## BlockRebalanceOnPoll pattern
+
+An alternative to callback-based offset management is to use `BlockRebalanceOnPoll` together with `AllowRebalance`. This approach prevents a rebalance from starting between a poll and an explicit allow, which makes the logic easier to reason about:
+
+```go
+cl, err := kgo.NewClient(
+    kgo.SeedBrokers("localhost:9092"),
+    kgo.ConsumerGroup("my-service"),
+    kgo.ConsumeTopics("events"),
+    kgo.BlockRebalanceOnPoll(),
+)
+
+for {
+    // A rebalance cannot start until AllowRebalance is called.
+    fetches := cl.PollRecords(ctx, 100)
+    fetches.EachRecord(func(r *kgo.Record) {
+        process(r)
+    })
+    if err := cl.CommitUncommittedOffsets(ctx); err != nil {
+        log.Printf("commit error: %v", err)
+    }
+    cl.AllowRebalance()
+}
+```
+
+<Tip>
+When using `BlockRebalanceOnPoll`, keep processing fast and use `PollRecords` to bound the number of records processed per iteration. Ensure your `RebalanceTimeout` is long enough to cover the time between consecutive `AllowRebalance` calls.
+</Tip>
+
+## Static membership
+
+Static membership (KIP-345, Kafka 2.4+) assigns a stable identity to a consumer group member, which prevents unnecessary partition reassignment when a member briefly disconnects and reconnects. This is useful for stateful consumers:
+
+```go
+cl, err := kgo.NewClient(
+    kgo.SeedBrokers("localhost:9092"),
+    kgo.ConsumerGroup("my-service"),
+    kgo.ConsumeTopics("events"),
+    kgo.InstanceID("consumer-pod-0"),
+)
+```
+
+You are responsible for ensuring `InstanceID` values are unique within the group and for managing them out-of-band (for example, by tying them to pod names in Kubernetes).

@@ -1,0 +1,187 @@
+---
+title: "Error handling patterns in franz-go clients"
+description: "Learn how errors surface from PollFetches, ProduceSync, and the kerr package, and how franz-go distinguishes retriable from fatal errors internally."
+keywords: ["kafka", "error handling", "kerr", "fetch errors", "produce errors", "franz-go", "kgo", "retriable"]
+---
+
+franz-go surfaces errors through the same APIs you use to produce and consume, rather than through a separate error channel. Understanding where errors appear, what types they carry, and when the client handles them internally versus delivering them to your code lets you build robust consuming and producing loops without missing failures or over-reacting to transient ones.
+
+## Errors from PollFetches
+
+`PollFetches` returns a `Fetches` value that may contain both records and errors for different topic-partitions. Always inspect errors before processing records:
+
+```go
+fetches := cl.PollFetches(ctx)
+if fetches.IsClientClosed() {
+    return // clean shutdown
+}
+
+if errs := fetches.Errors(); len(errs) > 0 {
+    for _, e := range errs {
+        log.Printf("fetch error topic=%s partition=%d: %v",
+            e.Topic, e.Partition, e.Err)
+    }
+}
+
+// Records may still be present even when there are errors.
+fetches.EachRecord(func(r *kgo.Record) {
+    process(r)
+})
+```
+
+`Fetches.Errors()` returns a `[]FetchError`, where each entry has a `Topic`, `Partition`, and `Err` field. A partition with an error may also have records — the two are independent.
+
+### Classes of fetch errors
+
+The source code documents several categories of errors, from most to least recoverable:
+
+<Accordion title="kerr.Error — Kafka protocol errors">
+Typed errors from the `kerr` package represent Kafka protocol error codes. Most that reach your poll loop are non-retriable (the client already retried retriable ones internally). Examples: `kerr.UnknownTopicOrPartition`, `kerr.TopicAuthorizationFailed`.
+
+```go
+var ke *kerr.Error
+if errors.As(e.Err, &ke) {
+    log.Printf("kafka error code=%d retriable=%v: %s",
+        ke.Code, ke.Retriable, ke.Message)
+}
+```
+</Accordion>
+
+<Accordion title="*kgo.ErrDataLoss — data loss detected">
+Injected when Kafka 2.1+ detects that records were lost on a partition. The client automatically resets the offset and resumes consuming — this error is informational. Log it and investigate, but you do not need to restart the client.
+
+```go
+var dl *kgo.ErrDataLoss
+if errors.As(e.Err, &dl) {
+    log.Printf("data loss on %s/%d: consumed to %d, reset to %d",
+        dl.Topic, dl.Partition, dl.ConsumedTo, dl.ResetTo)
+}
+```
+</Accordion>
+
+<Accordion title="context errors — context canceled or deadline exceeded">
+If the context you passed to `PollFetches` is canceled or times out, the error appears as a partition-level context error. You can check for it with `errors.Is(err, context.Canceled)` or `errors.Is(err, context.DeadlineExceeded)`.
+</Accordion>
+
+<Accordion title="*kgo.ErrGroupSession — consumer group session lost">
+Injected once when a group session is lost in a non-standard way — for example, due to ACL problems, an unreachable coordinator, or blocking rebalancing for too long. After this error the client attempts to rejoin the group automatically.
+
+```go
+var gs *kgo.ErrGroupSession
+if errors.As(e.Err, &gs) {
+    log.Printf("group session lost: %v", gs.Err)
+}
+```
+</Accordion>
+
+<Accordion title="kgo.ErrClientClosed — client was closed">
+Injected into every poll after `cl.Close()` is called. Use `fetches.IsClientClosed()` to detect this quickly, or check `errors.Is(err, kgo.ErrClientClosed)` on individual partition errors.
+</Accordion>
+
+## Errors from ProduceSync
+
+`ProduceSync` returns a `ProduceResults` slice. Use `FirstErr` to check whether any record failed:
+
+```go
+results := cl.ProduceSync(ctx, r1, r2, r3)
+if err := results.FirstErr(); err != nil {
+    log.Printf("at least one record failed: %v", err)
+}
+```
+
+For per-record error inspection:
+
+```go
+for _, res := range results {
+    if res.Err != nil {
+        log.Printf("record topic=%s failed: %v", res.Record.Topic, res.Err)
+    }
+}
+```
+
+Common produce errors:
+
+| Error | Meaning |
+|-------|---------|
+| `kgo.ErrRecordTimeout` | Record could not be delivered within `RecordDeliveryTimeout`. |
+| `kgo.ErrRecordRetries` | Record exceeded the `RecordRetries` limit. |
+| `kgo.ErrMaxBuffered` | Buffer is full and `TryProduce` was used (or `ManualFlushing` is on). |
+| `kgo.ErrClientClosed` | `cl.Close()` was called while the record was buffered. |
+| `kgo.ErrAborting` | `AbortBufferedRecords` was called while the record was buffered. |
+
+## The kerr package
+
+The `kerr` package translates Kafka protocol error codes into typed Go errors. Each `*kerr.Error` carries the Kafka error message string, the numeric code, a human-readable description, and a `Retriable` boolean indicating whether Kafka considers the error transient:
+
+```go
+import "github.com/twmb/franz-go/pkg/kerr"
+
+// Convert a code to an error (returns nil for code 0):
+err := kerr.ErrorForCode(code)
+
+// Check if a kerr.Error is retriable:
+if kerr.IsRetriable(err) {
+    // Kafka considers this error transient
+}
+
+// Inspect fields directly:
+var ke *kerr.Error
+if errors.As(err, &ke) {
+    fmt.Printf("code=%d message=%s retriable=%v description=%s\n",
+        ke.Code, ke.Message, ke.Retriable, ke.Description)
+}
+```
+
+Named sentinel values are exported for every Kafka error code, for example `kerr.UnknownTopicOrPartition`, `kerr.TopicAuthorizationFailed`, `kerr.OperationNotAttempted`. You can compare with `errors.Is`:
+
+```go
+if errors.Is(err, kerr.TopicAuthorizationFailed) {
+    log.Fatal("check ACLs for this topic")
+}
+```
+
+## Retriable vs non-retriable errors
+
+franz-go automatically retries a large class of transient errors without surfacing them to your code. The `IsRetryableBrokerErr` function (exported for use in hooks) describes the full set:
+
+- Network errors (`os.SyscallError`, `io.EOF`, `net.ErrClosed`) — retried unless they result from a non-timeout dial failure
+- `kerr.Error` where `Retriable == true` — retried per Kafka protocol definition
+- Broker connection death (`errChosenBrokerDead`) — the request is retried on the next available connection
+- Unknown or unavailable coordinator — retried with backoff
+
+Errors that reach your poll or produce callback are the ones the client cannot retry on your behalf — either because they are non-retriable by definition, or because the retry limit or timeout was exceeded. You should log these, and for truly fatal ones (authorization failures, data corruption), consider whether to restart the client or alert.
+
+## Context cancellation
+
+Canceling the context passed to `Produce` or `ProduceSync` signals the client to abandon the record if it has not yet been sent. Because idempotent production requires intact sequence numbers, a record is only dropped when it is safe to do so — either before any request was issued, or after the client received a definitive response for the most recent attempt.
+
+For consuming, canceling the context passed to `PollFetches` causes the poll to return early. The context error is injected as a partition-level error in the returned `Fetches`:
+
+```go
+ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+defer cancel()
+
+fetches := cl.PollFetches(ctx)
+if err := fetches.Err0(); errors.Is(err, context.DeadlineExceeded) {
+    // poll timed out; no records received
+}
+```
+
+`Fetches.Err0()` is a fast path that reads only the first error without a full linear scan — useful when you expect the only error to be a context cancellation.
+
+## Best practices
+
+<CardGroup cols={2}>
+  <Card title="Always check fetch errors" icon="triangle-exclamation">
+    Call `fetches.Errors()` before processing records. Records may be present alongside errors; checking errors separately ensures you don't silently lose error information.
+  </Card>
+  <Card title="Use errors.As for typed errors" icon="magnifying-glass">
+    Prefer `errors.As(err, &target)` over type assertions. franz-go wraps errors, so a direct type assertion may miss an error wrapped inside another.
+  </Card>
+  <Card title="Distinguish data loss from other errors" icon="database">
+    `*kgo.ErrDataLoss` is informational — the client has already recovered. Log it and move on rather than treating it as fatal.
+  </Card>
+  <Card title="Handle ErrClientClosed in loops" icon="power-off">
+    Check `fetches.IsClientClosed()` at the top of your poll loop to detect clean shutdowns without scanning all partition errors.
+  </Card>
+</CardGroup>
